@@ -154,6 +154,44 @@ your Stremio addons ──▶ Fast Combo ──▶ Mwatcher bridge ──▶ sta
                  ranks best-first     Plex-style, moves it in
 ```
 
+### 4.0 Where each piece runs — pick a layout first
+
+**A. Everything on one box.** Fast Combo, the bridge, Plex and the library all on the
+Lubuntu machine. This is what §4.1–4.4 assume, and `sudo bash install.sh` does the whole
+lot. Fast Combo stays on `127.0.0.1`, so nothing outside the box can reach it.
+
+**B. Addons on a VPS, Plex at home.** Your Stremio addons keep running on the VPS; only the
+bridge, Plex and the library live on the Lubuntu box. Tell the installer where the addons
+are and it skips cloning Fast Combo and skips the local `fastcombo.service`:
+
+```bash
+# on the Lubuntu box
+sudo FC_BASE_URL=https://addons.example.com FC_REMOTE_ACCESS_KEY=<your-key> bash install.sh
+```
+
+`FC_REMOTE_ACCESS_KEY` is the secret part of the addon link **on the VPS** (`FC_ACCESS_KEY`
+in that machine's Fast Combo config) — not a newly generated one.
+
+But reaching a VPS over the public internet puts that key on the wire, and the key *is*
+Fast Combo's only protection. The safer version is an SSH tunnel, which makes the remote
+look local so nothing has to be exposed at all:
+
+```bash
+ssh -N -L 7000:127.0.0.1:7000 ubuntu@<vps-ip>      # try it in the foreground first
+sudo FC_BASE_URL=http://127.0.0.1:7000 FC_REMOTE_ACCESS_KEY=<your-key> bash install.sh
+```
+
+Keep it up across reboots with `services/fastcombo-tunnel.service.example` (needs
+passwordless key auth, since a systemd service cannot answer a password prompt).
+
+Whichever you choose, **the bridge, Plex and the library must be on the same machine.** That
+is not a preference: the bridge writes files Plex has to read, staging must be on the same
+filesystem as the library for the atomic move to work, and in play-through mode (§4.6) your
+Plex clients stream *through the bridge* — so they have to be able to reach it.
+
+`sudo bash install.sh status` and `doctor` both understand layout B: they probe the remote
+URL instead of a local port, and doctor tells you if this machine cannot reach it.
+
 ### 4.1 Run Fast Combo (your addons, merged and ranked)
 
 [Fast Combo](https://github.com/AfzalAshraf/stremio-addons) is the addon side. For every title it asks all

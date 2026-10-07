@@ -1,0 +1,70 @@
+# =============================================================================
+#  fastcombo-tunnel.service -- keep a REMOTE Fast Combo reachable as if local
+# =============================================================================
+#  Use this when your Stremio addons run on a VPS but Plex and the library run at
+#  home. It holds an SSH tunnel open so the bridge can talk to the addons on
+#  127.0.0.1:7000 -- which means:
+#
+#    * your addon access key never crosses a public interface
+#    * the VPS does not have to expose Fast Combo to the internet at all
+#    * the bridge config is identical to the all-on-one-box setup
+#
+#  SETUP
+#    1. Key-based SSH must already work with no password prompt, because a systemd
+#       service cannot answer one:
+#         ssh-keygen -t ed25519            (if you do not have a key yet)
+#         ssh-copy-id ubuntu@YOUR_VPS_IP
+#         ssh ubuntu@YOUR_VPS_IP true      (must not ask for a password)
+#    2. Edit the -L line and the user@host below.
+#    3. Install:
+#         sudo cp services/fastcombo-tunnel.service.example \
+#                 /etc/systemd/system/fastcombo-tunnel.service
+#         sudo systemctl daemon-reload
+#         sudo systemctl enable --now fastcombo-tunnel
+#         curl -s http://127.0.0.1:7000/ -o /dev/null -w '%{http_code}\n'
+#    4. Then install the bridge pointing at the tunnel, not at the VPS:
+#         sudo FC_BASE_URL=http://127.0.0.1:7000 \
+#              FC_REMOTE_ACCESS_KEY=<the key from the VPS> bash install.sh
+#
+#  The -L numbers are  <local port>:<remote host>:<remote port>. The remote host is
+#  resolved FROM the VPS, so 127.0.0.1 there means the VPS itself -- which is exactly
+#  what you want when Fast Combo is bound to loopback on the VPS.
+# =============================================================================
+
+[Unit]
+Description=SSH tunnel to the remote Fast Combo (Stremio addons on a VPS)
+Documentation=https://github.com/AfzalAshraf/Mwatcher
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# The user whose ~/.ssh holds the key. Not root: keep the key in a normal home dir.
+User=afine
+
+# ExitOnForwardFailure: if the local port cannot be bound, fail loudly instead of
+# running a tunnel that forwards nothing (the bridge would then look "down").
+# ServerAlive*: notice a dropped VPS connection in ~90s rather than hanging forever.
+# BatchMode: never block on a password prompt.
+ExecStart=/usr/bin/ssh -N \
+    -o ExitOnForwardFailure=yes \
+    -o ServerAliveInterval=30 \
+    -o ServerAliveCountMax=3 \
+    -o BatchMode=yes \
+    -o StrictHostKeyChecking=accept-new \
+    -L 7000:127.0.0.1:7000 \
+    ubuntu@YOUR_VPS_IP
+
+Restart=always
+RestartSec=10
+
+# This unit needs no privileges beyond making an outbound connection.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target

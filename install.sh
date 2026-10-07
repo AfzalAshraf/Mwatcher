@@ -45,6 +45,32 @@ PLEX_LOG="$PLEX_DATA/Logs/Plex Media Server.log"
 FC_PORT="${FC_PORT:-7000}"
 BRIDGE_PORT="${BRIDGE_PORT:-8889}"
 
+# Fast Combo does NOT have to run on this machine. The common split is: addons on a VPS,
+# Plex + the library at home. Point the bridge at the remote one and this installer skips
+# cloning Fast Combo and skips the local fastcombo.service:
+#
+#   sudo FC_BASE_URL=https://addons.example.com bash install.sh
+#   sudo FC_BASE_URL=http://203.0.113.7:7000 FC_REMOTE_ACCESS_KEY=xxxx bash install.sh
+#
+# Reaching a VPS over the public internet exposes your addon key. The safer route is an
+# SSH tunnel, which makes the remote look local -- the installer prints that recipe.
+FC_BASE_URL="${FC_BASE_URL:-}"
+if [ -z "$FC_BASE_URL" ] && [ -f "$RUN_HOME/.config/mwatcher/bridge.env" ]; then
+  FC_BASE_URL="$(grep -E '^FASTCOMBO_BASE_URL=' "$RUN_HOME/.config/mwatcher/bridge.env" 2>/dev/null | head -1 | cut -d= -f2- || true)"
+fi
+
+fc_is_remote() {
+  [ -n "$FC_BASE_URL" ] || return 1
+  case "$FC_BASE_URL" in
+    *//127.0.0.1*|*//localhost*|*//\[::1\]*) return 1 ;;
+  esac
+  return 0
+}
+
+fc_target() {
+  if fc_is_remote; then printf '%s' "$FC_BASE_URL"; else printf 'http://127.0.0.1:%s' "$FC_PORT"; fi
+}
+
 # --------------------------------------------------------------- pretty print
 if [ -t 1 ]; then
   B=$'\033[1m'; D=$'\033[2m'; R=$'\033[0m'
@@ -87,7 +113,11 @@ do_status() {
 
   printf '\n%sListening ports%s\n' "$B" "$R"
   port_open 32400     && ok "32400  Plex Media Server"        || bad "32400  Plex is not listening"
-  port_open "$FC_PORT"    && ok "$FC_PORT  Fast Combo (your addons)"  || bad "$FC_PORT  Fast Combo is not listening"
+  if fc_is_remote; then
+    info "Fast Combo is remote: $FC_BASE_URL (not a local port)"
+  else
+    port_open "$FC_PORT"    && ok "$FC_PORT  Fast Combo (your addons)"  || bad "$FC_PORT  Fast Combo is not listening"
+  fi
   port_open "$BRIDGE_PORT" && ok "$BRIDGE_PORT  Mwatcher bridge + dashboard" || bad "$BRIDGE_PORT  bridge is not listening"
 
   printf '\n%sPaths%s\n' "$B" "$R"
@@ -114,22 +144,30 @@ do_status() {
   have ffprobe && ok "ffprobe (used by doctor)" || warn "ffprobe missing — doctor cannot verify media files"
 
   printf '\n%sKeys%s\n' "$B" "$R"
-  local key=""
-  [ -f "$CONFIG_DIR/fastcombo.env" ] && key="$(grep -E '^FC_ACCESS_KEY=' "$CONFIG_DIR/fastcombo.env" | head -1 | cut -d= -f2- || true)"
+  local key="" fcbase
+  fcbase="$(fc_target)"
+  if [ -f "$CONFIG_DIR/bridge.env" ]; then
+    key="$(grep -E '^FASTCOMBO_ACCESS_KEY=' "$CONFIG_DIR/bridge.env" 2>/dev/null | head -1 | cut -d= -f2- || true)"
+  fi
+  if [ -z "$key" ] && [ -f "$CONFIG_DIR/fastcombo.env" ]; then
+    key="$(grep -E '^FC_ACCESS_KEY=' "$CONFIG_DIR/fastcombo.env" 2>/dev/null | head -1 | cut -d= -f2- || true)"
+  fi
   if [ -n "$key" ]; then
     ok "Fast Combo access key set (${#key} chars)"
-    info "control panel:  http://127.0.0.1:$FC_PORT/$key/configure"
+    info "addon source:   $fcbase"
+    info "control panel:  $fcbase/$key/configure"
     info "dashboard:      http://127.0.0.1:$BRIDGE_PORT/"
-    if port_open "$FC_PORT"; then
-      local n
-      n="$(curl -s -m 8 "http://127.0.0.1:$FC_PORT/$key/manifest.json" 2>/dev/null | grep -o '"Addon [0-9]*"' | wc -l || echo 0)"
-      curl -s -m 8 "http://127.0.0.1:$FC_PORT/$key/manifest.json" 2>/dev/null | grep -q '"id"' \
-        && ok "Fast Combo answers with that key" \
-        || bad "Fast Combo rejects that key — bridge.env and fastcombo.env disagree"
+    local n
+    n="$(curl -s -m 10 "$fcbase/$key/manifest.json" 2>/dev/null | grep -o '"Addon [0-9]*"' | wc -l || echo 0)"
+    if curl -s -m 10 "$fcbase/$key/manifest.json" 2>/dev/null | grep -q '"id"'; then
+      ok "Fast Combo answers with that key"
       info "addons merged into the manifest description: ${n:-0}"
+    else
+      bad "Fast Combo at $fcbase did not answer with that key
+       (unreachable, wrong key, or it needs https from this network)"
     fi
   else
-    bad "no FC_ACCESS_KEY in $CONFIG_DIR/fastcombo.env"
+    bad "no access key in $CONFIG_DIR/bridge.env or $CONFIG_DIR/fastcombo.env"
   fi
 
   local bkey=""
@@ -211,9 +249,22 @@ do_doctor() {
 
   # ---- 1. services & ports --------------------------------------------------
   hdr "1. Services"
-  for s in plexmediaserver fastcombo mwatcher-bridge; do
+  local svc_list="plexmediaserver fastcombo mwatcher-bridge"
+  fc_is_remote && svc_list="plexmediaserver mwatcher-bridge"
+  for s in $svc_list; do
     svc_active "$s" && ok "$s running" || { bad "$s NOT running"; problems=$((problems+1)); }
   done
+  if fc_is_remote; then
+    info "Fast Combo runs elsewhere: $FC_BASE_URL"
+    if curl -s -m 10 -o /dev/null "$FC_BASE_URL" 2>/dev/null; then
+      ok "this machine can reach it"
+    else
+      bad "this machine CANNOT reach $FC_BASE_URL → every lookup fails.
+       Fix: check the VPS firewall, or tunnel it so it looks local:
+            ssh -N -L $FC_PORT:127.0.0.1:$FC_PORT <user>@<vps>   (then FC_BASE_URL=http://127.0.0.1:$FC_PORT)"
+      problems=$((problems+1))
+    fi
+  fi
   port_open 32400 && ok "Plex listening on 32400" || { bad "nothing on 32400"; problems=$((problems+1)); }
 
   # ---- 2. Plex itself answers ----------------------------------------------
@@ -582,7 +633,19 @@ do_install() {
 
   # ---- 4. Fast Combo -------------------------------------------------------
   hdr "4. Fast Combo (your Stremio addons)"
-  if [ -d "$FC_DIR/.git" ]; then
+  if fc_is_remote; then
+    ok "using a REMOTE Fast Combo: $FC_BASE_URL"
+    info "skipping the clone and the local fastcombo.service — your addons stay on that box"
+    if printf '%s' "$FC_BASE_URL" | grep -q '^http://'; then
+      warn "that is plain http over a non-loopback network: your access key travels in the
+       clear. Use https, or tunnel it:  ssh -N -L $FC_PORT:127.0.0.1:$FC_PORT <user>@<vps>"
+    fi
+    if [ -z "${FC_REMOTE_ACCESS_KEY:-}" ]; then
+      warn "FC_REMOTE_ACCESS_KEY was not given, so the bridge has no key to use yet.
+       Add the secret part of your addon link to $CONFIG_DIR/bridge.env:
+            FASTCOMBO_ACCESS_KEY=<the key from your VPS Fast Combo>"
+    fi
+  elif [ -d "$FC_DIR/.git" ]; then
     ok "already cloned: $FC_DIR  (update with: cd $FC_DIR && git pull)"
   else
     info "cloning AfzalAshraf/stremio-addons"
@@ -611,7 +674,14 @@ EOF
   # ---- 5. bridge config ----------------------------------------------------
   hdr "5. Bridge config"
   local fckey
-  fckey="$(grep -E '^FC_ACCESS_KEY=' "$CONFIG_DIR/fastcombo.env" 2>/dev/null | head -1 | cut -d= -f2- || true)"
+  if fc_is_remote; then
+    fckey="${FC_REMOTE_ACCESS_KEY:-}"
+    if [ -z "$fckey" ] && [ -f "$CONFIG_DIR/bridge.env" ]; then
+      fckey="$(grep -E '^FASTCOMBO_ACCESS_KEY=' "$CONFIG_DIR/bridge.env" 2>/dev/null | head -1 | cut -d= -f2- || true)"
+    fi
+  else
+    fckey="$(grep -E '^FC_ACCESS_KEY=' "$CONFIG_DIR/fastcombo.env" 2>/dev/null | head -1 | cut -d= -f2- || true)"
+  fi
   if [ -f "$CONFIG_DIR/bridge.env" ]; then
     ok "keeping your existing $CONFIG_DIR/bridge.env"
     local bk; bk="$(grep -E '^FASTCOMBO_ACCESS_KEY=' "$CONFIG_DIR/bridge.env" | head -1 | cut -d= -f2- || true)"
@@ -621,17 +691,27 @@ EOF
       ok "keys now match"
     fi
   else
-    cat > "$CONFIG_DIR/bridge.env" <<EOF
-FASTCOMBO_ACCESS_KEY=$fckey
-EOF
+    {
+      echo "FASTCOMBO_ACCESS_KEY=$fckey"
+      fc_is_remote && echo "FASTCOMBO_BASE_URL=$FC_BASE_URL"
+    } > "$CONFIG_DIR/bridge.env"
     chown "$RUN_USER:$RUN_USER" "$CONFIG_DIR/bridge.env"
     chmod 600 "$CONFIG_DIR/bridge.env"
     ok "created $CONFIG_DIR/bridge.env (mode 600)"
   fi
+  if fc_is_remote && ! grep -q "^FASTCOMBO_BASE_URL=" "$CONFIG_DIR/bridge.env" 2>/dev/null; then
+    echo "FASTCOMBO_BASE_URL=$FC_BASE_URL" >> "$CONFIG_DIR/bridge.env"
+    ok "recorded the remote addon URL in bridge.env"
+  fi
 
   # ---- 6. systemd units ----------------------------------------------------
   hdr "6. Services"
-  for unit in fastcombo mwatcher-bridge; do
+  local units="fastcombo mwatcher-bridge"
+  if fc_is_remote; then
+    units="mwatcher-bridge"
+    info "not installing fastcombo.service — addons are served from $FC_BASE_URL"
+  fi
+  for unit in $units; do
     local src="$REPO_DIR/services/$unit.service" dst="/etc/systemd/system/$unit.service"
     [ -f "$src" ] || die "missing $src"
     # rewrite the paths/user for THIS machine instead of the documented example ones
@@ -644,13 +724,15 @@ EOF
         -e "s|^Group=afine|Group=$RUN_USER|" \
         -e "s|ExecStart=/usr/bin/node |ExecStart=$(command -v node) |" \
         -e "s|ExecStart=/usr/bin/python3 |ExecStart=$(command -v python3) |" \
+        -e "s|^Environment=FASTCOMBO_BASE_URL=.*|Environment=FASTCOMBO_BASE_URL=$(fc_target)|" \
         "$src" > "$dst"
     ok "wrote $dst"
   done
   systemctl daemon-reload
-  systemctl enable --now fastcombo mwatcher-bridge >/dev/null 2>&1 || true
+  # shellcheck disable=SC2086
+  systemctl enable --now $units >/dev/null 2>&1 || true
   sleep 2
-  for s in fastcombo mwatcher-bridge; do
+  for s in $units; do
     svc_active "$s" && ok "$s running" || bad "$s failed to start → sudo journalctl -u $s -n 30 --no-pager"
   done
 
@@ -876,6 +958,9 @@ Mwatcher installer
   sudo bash install.sh uninstall          remove the services (keeps media)
 
 Safe to re-run: existing keys, passwords and addon lists are preserved.
+
+Addons on another machine (e.g. a VPS), Plex here:
+  sudo FC_BASE_URL=https://addons.example.com FC_REMOTE_ACCESS_KEY=<key> bash install.sh
 EOF
 }
 
