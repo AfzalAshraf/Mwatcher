@@ -295,10 +295,11 @@ live link probing (the fake files answer `Range` requests, which is what it prob
 
 ### 4.5 What this does NOT do (be honest about the trade-off)
 
-- **It downloads, it does not stream on demand.** Unlike Stremio, the file lands on disk before Plex can
-  play it. Budget disk space and the time to fetch it (a 4K movie is 15-25 GB). Instant "press play on
-  anything" is not what this gives you; "the best copy of what you asked for, playable on every Plex
-  client forever" is.
+- **By default it downloads; it does not stream on demand.** Unlike Stremio, the file lands on disk
+  before Plex can play it. Budget disk space and the time to fetch it (a 4K movie is 15-25 GB).
+  That is the price of "the best copy of what you asked for, playable on every Plex client forever".
+  If you would rather keep nothing on disk, see **§4.6** — play-through adds a title as a 45-byte
+  pointer and streams it through a capped cache instead.
 - **Torrent/debrid links are skipped.** Addons that return `infoHash` need Real-Debrid/TB/alldebrid-style
   resolution first. If that is most of your addons, prefer addons that return direct HTTP links, or add a
   debrid step in front of the downloader.
@@ -306,17 +307,80 @@ live link probing (the fake files answer `Range` requests, which is what it prob
   Unsupported AppStore do not load on a current Plex server, so there is no way to bolt an addon *inside*
   Plex itself. If playing live HTTP sources without downloading is a hard requirement, run **Jellyfin** or
   **Emby** alongside Plex — both still have working plugin systems.
-- **`.strm` pointer files** (a text file containing a URL, placed in the library) are the only way to make
-  Plex reference a remote link, and support is patchy: many clients ignore them and remote/transcoded
-  playback breaks. Experiment only:
+- **Hand-written `.strm` pointer files are unreliable.** A `.strm` is a text file containing a URL —
+  the only way to make Plex reference something remote. Written by hand it freezes a link that usually
+  expires within minutes, cannot carry the headers many hosts demand, and when the host answers with a
+  captcha page Plex tries to *play a web page*, which is error s1001:
 
   ```bash
+  # do not do this -- see §4.6 for the version that actually works
   echo "https://files.example.com/Dune.2021.1080p.mkv" > "/home/afine/media/Movies/Dune (2021)/Dune (2021).strm"
   ```
 
-### 4.6 Seerr — request a title and your own server downloads it (no debrid)
+  §4.6 keeps the pointer but puts the bridge behind it, which fixes all four problems.
 
-§4.1–4.5 pull a file down on demand. The other way to build a library is to **request** a
+### 4.6 Play-through — add titles WITHOUT downloading them
+
+If you do not want files on disk, do not download any. The library gets a ~45-byte `.strm`
+pointer, and when Plex plays it the bridge scrapes a **fresh** link from your addons at that
+moment, opens it with whatever headers the host demands, and streams the bytes through —
+Range-aware, so seeking works — while keeping a capped cache on disk.
+
+```bash
+curl -X POST http://127.0.0.1:8889/add -H 'Content-Type: application/json' \
+     -d '{"title":"Dune","year":2021}'
+```
+
+```
+downloaded_bytes : 0                                  <- nothing was saved
+strm             : ~/media/Movies/Dune (2021)/Dune (2021).strm    (45 bytes)
+play_url         : http://192.168.0.34:8889/play/6f2c1ab9d0.mkv
+candidates       : 3 live links, best first
+```
+
+Why this beats writing an addon URL into a `.strm` yourself:
+
+| | hand-written `.strm` | play-through |
+|---|---|---|
+| Link age | frozen at add time, expires in minutes | scraped at play time, always fresh |
+| Host headers | cannot be expressed | sent by the bridge |
+| Captcha / HTML wall | Plex plays a web page → **s1001** | sniffed before the first byte is committed, then fails over to the next link |
+| Seeking | up to the host | bridge answers `Range` from cache or upstream |
+| Disk | none | a capped cache (default 20 GB, evicts oldest first) |
+
+Make it the default with `TELESTREAM_ACTION=strm`, or per title with `"action":"strm"`. On the
+dashboard it is the **Add without downloading** button.
+
+```bash
+curl -s localhost:8889/plays    # every pointer, its URL, and whether it is cached
+curl -s localhost:8889/cache    # cache dir, size, cap, percent full
+```
+
+**The one setting that decides whether this works:** `TELESTREAM_PUBLIC_BASE_URL`. It is the
+address written into the `.strm`, and your Plex **client** must reach it — your phone on 4G,
+your TV downstairs. Unset, you get the LAN IP (fine at home, s1001 away from it). Point it at
+`127.0.0.1` and *every* other device fails. Away from home, set it to the same tunnel or
+Tailscale address you gave Plex for remote access (§5c / §5d):
+
+```bash
+sudo mkdir -p /etc/systemd/system/mwatcher-bridge.service.d
+echo -e '[Service]\nEnvironment=TELESTREAM_PUBLIC_BASE_URL=https://plex.yourdomain.com' \
+  | sudo tee /etc/systemd/system/mwatcher-bridge.service.d/override.conf
+sudo systemctl daemon-reload && sudo systemctl restart mwatcher-bridge
+```
+
+`sudo bash install.sh doctor "<title>"` inspects each pointer: is it loopback, does the bridge
+actually answer that address, and is it a foreign link that will expire.
+
+Honest limits: the bridge is now in the playback path, so if it is down nothing plays. A title
+whose links are all dead fails at *play* time rather than at *add* time — the bridge resolves
+once when you add it precisely to catch that early. And if Plex decides to transcode, it pulls
+the whole file through the bridge, which is exactly what the cache is for.
+
+### 4.7 Seerr — request a title and your own server downloads it (no debrid)
+
+§4.1–4.5 pull a file down on demand and §4.6 avoids the download entirely. The third way to
+build a library is to **request** a
 title and let your server fetch it properly, once, and keep it. That is what
 [Seerr](https://github.com/fallenbagel/seerr) does — and it needs no debrid subscription,
 because torrents/NZBs do the fetching instead.
@@ -577,7 +641,7 @@ That checks, in the order these actually break:
 | # | Cause | How `doctor` proves it | Fix |
 |---|---|---|---|
 | 1 | **The file is not a video.** The download saved an HTML error page (CDN wall, "Just a moment…", 403/404, login redirect) or a truncated stub. Plex lists it because the *filename* matched; there is nothing inside to play | `ffprobe` reports *no video and no audio stream*; file is a few KB; first bytes contain `<!doctype html` | Delete the file and re-fetch — the bridge now validates before it enters the library and fails over to the next stream: `rm "…/The Uprising (2023).mkv"` then `curl -X POST localhost:8889/fetch -d '{"title":"The Uprising"}'` |
-| 2 | **A `.strm` pointer file** containing `http://127.0.0.1:…` or a LAN IP. Your phone/TV cannot reach that address, so browsing works but playback does not | `doctor` prints the .strm target and flags private addresses | Delete it and let the bridge download the real file (§4.5 explains why `.strm` is a dead end) |
+| 2 | **A `.strm` pointer the client cannot reach.** Loopback, or a LAN IP when you are away, or a foreign link that expired | `doctor` prints the target, says whether the bridge answers *that address*, and flags loopback/LAN/foreign | Set `TELESTREAM_PUBLIC_BASE_URL` to an address your clients reach (§4.6), then re-add the title — or delete the `.strm` and download the file instead |
 | 3 | **`plex` user cannot read the file** | `sudo -u plex test -r <file>` fails | `sudo chmod -R a+rX ~/media && sudo usermod -aG $USER plex && sudo systemctl restart plexmediaserver` |
 | 4 | **Secure connections = Required** together with a proxy/tunnel whose certificate is not Plex's `*.plex.direct` | `secureConnections="2"` in Preferences.xml | Set **Preferred** (Settings → Server → Network) |
 | 5 | **Custom server access URL points at localhost**, or the public URL is missing | `customConnections` contains `127.0.0.1`/`localhost` | `http://192.168.0.34:32400,https://plex.yourdomain.com` — LAN first (§5c) |
@@ -638,6 +702,10 @@ curl -s "http://127.0.0.1:8889/search?q=dune"      # title -> IMDb id
 curl -s "http://127.0.0.1:8889/streams?id=tt1160419&prefer=fastest"   # ranked candidates
 curl -s http://127.0.0.1:8889/jobs                 # queue + provenance
 curl -s http://127.0.0.1:8889/seerr                # Seerr reachable? what is queued?
+curl -s -X POST http://127.0.0.1:8889/add -H 'Content-Type: application/json' \
+  -d '{"title":"Dune","year":2021}'                # add WITHOUT downloading (play-through)
+curl -s http://127.0.0.1:8889/plays                # pointers + whether each is cached
+curl -s http://127.0.0.1:8889/cache                # cache size vs cap
 curl -s -X POST http://127.0.0.1:8889/request -H 'Content-Type: application/json' \
   -d '{"title":"Dune","year":2021}'                # request it -> Radarr/Sonarr fetch it
 curl -s -X POST http://127.0.0.1:8889/fetch -H 'Content-Type: application/json' \

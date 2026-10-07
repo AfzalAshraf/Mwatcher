@@ -189,7 +189,11 @@ do_status() {
   info "${nmovies:-0} movie file(s), ${ntv:-0} episode file(s)"
   local nstrm
   nstrm="$(find "$MEDIA_DIR" -type f -iname '*.strm' 2>/dev/null | wc -l || echo 0)"
-  [ "${nstrm:-0}" -gt 0 ] && bad "$nstrm .strm pointer file(s) — these commonly cause s1001, see doctor" || true
+  if [ "${nstrm:-0}" -gt 0 ]; then
+    info "$nstrm .strm pointer file(s) — play-through mode: the bridge scrapes a fresh link"
+    info "                                    and streams it, so nothing is downloaded"
+    info "                                    (doctor checks each one is client-reachable)"
+  fi
   local npart
   npart="$(find "$MEDIA_DIR/staging" -type f 2>/dev/null | wc -l || echo 0)"
   [ "${npart:-0}" -gt 0 ] && warn "$npart unfinished file(s) in staging/" || true
@@ -285,24 +289,63 @@ do_doctor() {
       ext="${f##*.}"
       printf '\n  %s%s%s  (%s bytes)\n' "$B" "$f" "$R" "$(numfmt --to=iec "$size" 2>/dev/null || echo "$size")"
 
-      # .strm = a text pointer, the usual s1001 trap
+      # .strm = a text pointer. This is a SUPPORTED mode (play-through: the bridge scrapes
+      # a fresh link at play time and streams it, so nothing is downloaded). It only goes
+      # wrong when the CLIENT cannot reach the URL inside -- which is what s1001 means.
       if [ "$ext" = "strm" ]; then
         local target; target="$(head -c 500 "$f" | tr -d '\r\n')"
-        bad ".strm pointer file → $target"
-        case "$target" in
-          *127.0.0.1*|*localhost*|*192.168.*)
-            bad "  It points at a private/localhost address. Your Plex CLIENT (phone/TV)
-  cannot reach that, so playback fails with s1001 even though the item is listed.
-  Fix: delete the .strm and let the bridge download the real file instead:
+        info ".strm pointer → $target"
+        if printf '%s' "$target" | grep -q ":$BRIDGE_PORT/play/"; then
+          # ---- our own play-through pointer -------------------------------------
+          case "$target" in
+            *127.0.0.1*|*localhost*|*0.0.0.0*)
+              bad "  It points at loopback, so only THIS machine can play it; every other
+  Plex client fails with s1001.
+  Fix: tell the bridge the address your clients use, then re-add the title:
+       echo 'TELESTREAM_PUBLIC_BASE_URL=http://<lan-ip-or-tunnel-host>:$BRIDGE_PORT' \\
+         | sudo tee -a /etc/systemd/system/mwatcher-bridge.service.d/override.conf
+       sudo systemctl daemon-reload && sudo systemctl restart mwatcher-bridge"
+              problems=$((problems+1))
+              ;;
+            *)
+              ok "  play-through pointer — no downloaded file, that is intentional"
+              local tpath; tpath="$(printf '%s' "$target" | sed -E 's#^[a-zA-Z]+://[^/]+##')"
+              if curl -s -m 8 -r 0-1 -o /dev/null "$target" 2>/dev/null; then
+                ok "  the bridge answers that URL, so clients can stream through it"
+              elif curl -s -m 8 -r 0-1 -o /dev/null "http://127.0.0.1:$BRIDGE_PORT$tpath" 2>/dev/null; then
+                warn "  the bridge answers locally but NOT at that address — clients on other
+  machines will get s1001. Check the firewall, the IP, and any tunnel:
+       sudo ufw allow from 192.168.0.0/16 to any port $BRIDGE_PORT"
+                problems=$((problems+1))
+              else
+                bad "  the bridge does not answer that URL at all → s1001.
+  Fix: sudo systemctl restart mwatcher-bridge, then re-test playback"
+                problems=$((problems+1))
+              fi
+              case "$target" in
+                *192.168.*|*10.*|*172.1[6-9].*|*172.2[0-9].*|*172.3[01].*)
+                  info "  LAN address: fine at home. Away from home set
+  TELESTREAM_PUBLIC_BASE_URL to your tunnel/Tailscale URL, or clients get s1001."
+                  ;;
+              esac
+              ;;
+          esac
+        elif printf '%s' "$target" | grep -qE "127\.0\.0\.1|localhost"; then
+          bad "  Points at loopback and is NOT this bridge → your Plex client cannot reach it.
+  Fix: rm \"$f\"   then let the bridge serve it:
+       curl -X POST http://127.0.0.1:$BRIDGE_PORT/add -H 'Content-Type: application/json' \\
+            -d '{\"title\":\"$title\"}'"
+          problems=$((problems+1))
+        else
+          warn "  A direct link to someone else's host. Those expire (often within minutes),
+  cannot carry the headers some hosts demand, and Plex's .strm support is patchy —
+  that combination is a classic intermittent s1001.
+  Better: let the bridge scrape a fresh link at play time and stream it through:
        rm \"$f\"
-       curl -X POST http://127.0.0.1:$BRIDGE_PORT/fetch -H 'Content-Type: application/json' -d '{\"title\":\"$title\"}'"
-            ;;
-          *)
-            warn "  Remote .strm: Plex support is patchy and remote/transcoded playback often
-  fails with s1001. Prefer a real downloaded file."
-            ;;
-        esac
-        problems=$((problems+1))
+       curl -X POST http://127.0.0.1:$BRIDGE_PORT/add -H 'Content-Type: application/json' \\
+            -d '{\"title\":\"$title\"}'"
+          problems=$((problems+1))
+        fi
         continue
       fi
 

@@ -36,7 +36,23 @@ Three ways to drive it
      GET /config               effective configuration
      GET /healthz              ok
      GET /seerr                is Seerr reachable + what is queued for download
+     GET /plays                every play-through pointer, and whether it is cached
+     GET /cache                cache dir, size vs cap, oldest-first eviction
      POST /request             ask Seerr to fetch a title (Radarr/Sonarr download it)
+     POST /add                 add a title WITHOUT downloading it (play-through .strm)
+
+PLAY-THROUGH -- add titles without downloading them (action=strm):
+
+     POST /add   -d '{"title":"Dune","year":2021}'      # 0 bytes downloaded, 45-byte .strm
+     GET /play/<key>.mkv                                # what Plex then asks for
+
+  Instead of a file, the library gets a tiny .strm pointer at this bridge. When Plex plays
+  it, the bridge scrapes a FRESH link from your addons at that moment, opens it with the
+  headers the host demands, and streams it through -- Range-aware, so seeking works --
+  while keeping a capped cache (oldest evicted first). A host serving a captcha/HTML wall
+  is detected BEFORE the first byte is committed and the next link is tried.
+  TELESTREAM_PUBLIC_BASE_URL is the address written into the .strm and MUST be reachable
+  from your Plex clients, not from this server -- loopback there means s1001 everywhere.
 
 SEERR -- request it instead of streaming it (no debrid service needed):
 
@@ -71,6 +87,11 @@ truth (see services/mwatcher-bridge.service and config/bridge.env.example):
                               direct media link ({url}/{title} substituted). Default off --
                               Fast Combo is the source now.
   BRIDGE_HOST / BRIDGE_PORT   Endpoint bind address              (default 127.0.0.1:8889)
+  TELESTREAM_ACTION           stream | strm | seerr | both       (default stream)
+  TELESTREAM_PUBLIC_BASE_URL  Address CLIENTS reach this bridge at (default: LAN IP)
+  TELESTREAM_CACHE_DIR        Play-through cache                 (default ~/media/cache)
+  TELESTREAM_CACHE_MAX_GB     Cache cap, oldest evicted first    (default 20)
+  TELESTREAM_RESOLVE_TTL      Seconds before a link is re-scraped (default 300)
   SEERR_URL                   Seerr base url                     (default off)
   SEERR_API_KEY               Seerr -> Settings -> General       (admin credential!)
   SEERR_MODE                  off | request | both               (default off)
@@ -94,6 +115,7 @@ import os
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -324,6 +346,17 @@ _HTML_MARKERS = (
     b'"error"', b'"errors"', b"cloudflare", b"access denied", b"forbidden",
     b"not found", b"captcha", b"please enable javascript", b"just a moment",
 )
+def sniff_html(data: bytes) -> str | None:
+    """
+    Return a marker if these bytes are a web page / JSON error rather than a video, else
+    None. Used both after a download and BEFORE a play-through response is committed, so
+    a captcha wall never reaches Plex as "media" (which is what produces error s1001).
+    """
+    head = (data or b"")[:2048].lower()
+    hit = next((m for m in _HTML_MARKERS if m in head), None)
+    return hit.decode() if hit else None
+
+
 MIN_BYTES = int(os.environ.get("TELESTREAM_MIN_BYTES", str(20 * 1024 * 1024)))
 MIN_DURATION = float(os.environ.get("TELESTREAM_MIN_DURATION", "30"))
 VERIFY_MEDIA = os.environ.get("TELESTREAM_VERIFY_MEDIA", "1").lower() not in ("0", "false", "no")
@@ -347,12 +380,12 @@ def validate_media(path: str, stream_url: str = "") -> dict:
         )
 
     with open(path, "rb") as fh:
-        head = fh.read(2048).lower()
-    hit = next((m for m in _HTML_MARKERS if m in head), None)
-    if hit:
+        head = fh.read(2048)
+    marker = sniff_html(head)
+    if marker:
         snippet = head[:120].decode("utf-8", "replace").strip()
         raise RuntimeError(
-            f"downloaded a web page, not a video (found {hit.decode()!r}: {snippet!r}). "
+            f"downloaded a web page, not a video (found {marker!r}: {snippet!r}). "
             f"The host is behind a login/captcha/403 wall -- trying the next stream"
         )
 
@@ -406,6 +439,243 @@ def validate_media(path: str, stream_url: str = "") -> dict:
 
 
 # --------------------------------------------------------------------------- jobs
+
+# =============================================================================
+#  Play-through: scrape the link, cache it, let Plex play it -- no download
+# =============================================================================
+# Instead of saving a permanent copy, the library gets a tiny .strm file pointing at this
+# bridge. When Plex plays it, the bridge asks your addons for a FRESH link right then,
+# opens it with whatever headers the host demands, and streams the bytes through
+# (Range-aware) while keeping a capped cache on disk. So:
+#
+#   * nothing is downloaded up front -- a title costs a few hundred bytes in the library
+#   * links never go stale, because they are scraped at play time, not at add time
+#   * hosts that need special headers work, which a bare .strm URL cannot do
+#   * the cache is capped and self-evicting, so it cannot eat your disk
+#
+# THE ONE THING THAT BREAKS IT: the .strm URL must be reachable from the CLIENT, not just
+# from the server. A .strm containing 127.0.0.1 gives every remote device Plex error
+# s1001. Set TELESTREAM_PUBLIC_BASE_URL to the address your clients actually use (your LAN
+# IP, or your tunnel/Tailscale URL). `install.sh doctor` flags .strm files that point at
+# loopback.
+
+PLAY: dict[str, dict] = {}
+PLAY_LOCK = threading.Lock()
+MAX_PLAYS = int(os.environ.get("TELESTREAM_MAX_PLAYS", "500"))
+
+CACHE_DIR = os.environ.get("TELESTREAM_CACHE_DIR", os.path.join(HOME, "media", "cache"))
+CACHE_MAX_BYTES = int(float(os.environ.get("TELESTREAM_CACHE_MAX_GB", "20")) * 1024 ** 3)
+CACHE_ENABLED = os.environ.get("TELESTREAM_CACHE", "1").lower() not in ("0", "false", "no")
+RESOLVE_TTL = float(os.environ.get("TELESTREAM_RESOLVE_TTL", "300"))
+PLAY_TIMEOUT = float(os.environ.get("TELESTREAM_PLAY_TIMEOUT", "30"))
+PUBLIC_BASE_URL = os.environ.get("TELESTREAM_PUBLIC_BASE_URL", "").rstrip("/")
+DEFAULT_ACTION = os.environ.get("TELESTREAM_ACTION", "").strip().lower()
+CHUNK = 256 * 1024
+ACTIONS = ("stream", "strm", "seerr", "both")
+
+
+def lan_ip() -> str:
+    """The address this box uses to reach the internet -- what LAN clients should use."""
+    try:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            probe.connect(("1.1.1.1", 80))   # nothing is sent; this only picks the route
+            return probe.getsockname()[0]
+        finally:
+            probe.close()
+    except OSError:
+        return "127.0.0.1"
+
+
+def play_base_url() -> str:
+    """Base URL written into .strm files. It must be reachable from the CLIENT."""
+    if PUBLIC_BASE_URL:
+        return PUBLIC_BASE_URL
+    host = BRIDGE_HOST if BRIDGE_HOST not in ("", "0.0.0.0") else ""
+    if not host or host in ("127.0.0.1", "localhost"):
+        host = lan_ip()
+    return f"http://{host}:{BRIDGE_PORT}"
+
+
+def new_play_key(payload: dict) -> str:
+    key = uuid.uuid4().hex[:10]
+    with PLAY_LOCK:
+        PLAY[key] = {"payload": payload, "created": time.time(), "resolved": 0.0,
+                     "candidates": [], "plan": {}, "hits": 0}
+        if len(PLAY) > MAX_PLAYS:
+            for stale in sorted(PLAY, key=lambda k: PLAY[k]["created"])[: len(PLAY) - MAX_PLAYS]:
+                PLAY.pop(stale, None)
+    return key
+
+
+def play_entry(key: str) -> dict:
+    with PLAY_LOCK:
+        entry = PLAY.get(key)
+    if not entry:
+        raise KeyError(key)
+    return entry
+
+
+def resolve_for_play(key: str) -> list:
+    """
+    Fresh addon links for a play key. Re-scraped whenever the last scrape is older than
+    RESOLVE_TTL seconds, because addon links expire -- that is the whole reason the
+    resolution happens at play time instead of at add time.
+    """
+    entry = play_entry(key)
+    now = time.time()
+    if entry["candidates"] and (now - entry["resolved"]) < RESOLVE_TTL:
+        return entry["candidates"]
+    plan = fastcombo_plan(entry["payload"])
+    slim = {k: plan.get(k) for k in ("imdb", "stype", "sid", "title", "year", "kind",
+                                     "episode", "season", "prefer", "total", "downloadable")}
+    with PLAY_LOCK:
+        entry["candidates"] = plan["ordered"]
+        entry["plan"] = slim
+        entry["resolved"] = time.time()
+        entry["hits"] = entry.get("hits", 0) + 1
+    return plan["ordered"]
+
+
+def cache_path(key: str, final: bool = True) -> str:
+    return os.path.join(CACHE_DIR, key + (".mkv" if final else ".part"))
+
+
+def evict_cache() -> int:
+    """Drop the oldest finished cache files until we are back under the cap."""
+    if not CACHE_ENABLED:
+        return 0
+    try:
+        names = os.listdir(CACHE_DIR)
+    except OSError:
+        return 0
+    files = []
+    for name in names:
+        path = os.path.join(CACHE_DIR, name)
+        if not os.path.isfile(path) or name.endswith(".part"):
+            continue                        # never evict a stream still in progress
+        try:
+            files.append((os.path.getmtime(path), os.path.getsize(path), path))
+        except OSError:
+            pass
+    total = sum(size for _, size, _ in files)
+    if total <= CACHE_MAX_BYTES:
+        return 0
+    removed = 0
+    for _, size, path in sorted(files):     # oldest first
+        if total <= CACHE_MAX_BYTES:
+            break
+        try:
+            os.remove(path)
+            total -= size
+            removed += 1
+        except OSError:
+            pass
+    if removed:
+        log(f"cache: evicted {removed} file(s) to stay under "
+            f"{CACHE_MAX_BYTES / 1024 ** 3:.1f} GB (now {total / 1024 ** 3:.2f} GB)")
+    return removed
+
+
+def cache_stats() -> dict:
+    items = []
+    try:
+        for name in sorted(os.listdir(CACHE_DIR)):
+            path = os.path.join(CACHE_DIR, name)
+            if os.path.isfile(path):
+                items.append({"name": name, "bytes": os.path.getsize(path),
+                              "age_seconds": int(time.time() - os.path.getmtime(path)),
+                              "complete": not name.endswith(".part")})
+    except OSError:
+        pass
+    used = sum(i["bytes"] for i in items)
+    return {"cache_dir": CACHE_DIR, "enabled": CACHE_ENABLED,
+            "max_gb": round(CACHE_MAX_BYTES / 1024 ** 3, 2),
+            "used_gb": round(used / 1024 ** 3, 3), "files": len(items),
+            "percent_full": round(100 * used / CACHE_MAX_BYTES, 1) if CACHE_MAX_BYTES else 0.0,
+            "resolve_ttl_seconds": RESOLVE_TTL, "items": items[-20:]}
+
+
+def play_list() -> list[dict]:
+    with PLAY_LOCK:
+        out = []
+        for key, entry in PLAY.items():
+            plan = entry.get("plan") or {}
+            payload = entry.get("payload") or {}
+            out.append({
+                "key": key,
+                "title": plan.get("title") or payload.get("title") or "",
+                "year": plan.get("year") or payload.get("year") or "",
+                "kind": plan.get("kind") or payload.get("kind") or "",
+                "episode": plan.get("episode") or payload.get("episode") or "",
+                "imdb": plan.get("imdb") or payload.get("imdb") or "",
+                "play_url": f"{play_base_url()}/play/{key}.mkv",
+                "cached": os.path.exists(cache_path(key, True)),
+                "candidates": len(entry.get("candidates") or []),
+                "created": entry["created"], "resolved": entry.get("resolved") or 0,
+            })
+    return sorted(out, key=lambda d: d["created"], reverse=True)
+
+
+def add_strm(payload: dict) -> dict:
+    """
+    Put a title in the library WITHOUT downloading it: resolve once now (so a title with
+    no working link fails immediately instead of at play time), then write a .strm that
+    points at this bridge. Plex reads the pointer, asks us, and we scrape + stream.
+    """
+    key = new_play_key(payload)
+    try:
+        candidates = resolve_for_play(key)
+    except Exception:
+        with PLAY_LOCK:
+            PLAY.pop(key, None)
+        raise
+    entry = play_entry(key)
+    plan = entry["plan"]
+    kind = plan.get("kind") or payload.get("kind") or "movie"
+    title = plan.get("title") or payload.get("title") or key
+    year = plan.get("year") or payload.get("year") or ""
+    episode = plan.get("episode") or payload.get("episode") or ""
+    target_dir, base = destination(kind, title, year, episode, payload.get("dest"))
+    os.makedirs(target_dir, exist_ok=True)
+
+    override = (payload.get("public_url") or "").strip().rstrip("/")
+    root = override or play_base_url()
+    url = f"{root}/play/{key}.mkv"
+    path = os.path.join(target_dir, base + ".strm")
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        handle.write(url + "\n")
+    os.chmod(tmp, 0o644)                     # the plex user must be able to read it
+    os.replace(tmp, path)
+    log(f"strm: {path} -> {url} ({len(candidates)} live candidate link(s))")
+    return {
+        "key": key, "strm": path, "play_url": url, "title": title, "year": year,
+        "kind": kind, "episode": episode, "imdb": plan.get("imdb") or "",
+        "candidates": len(candidates),
+        "picked": candidates[0].summary if candidates else "",
+        "bytes_written": len(url) + 1,
+        "downloaded_bytes": 0,
+        "warning": ("the .strm points at loopback -- only THIS machine can play it. Set "
+                    "TELESTREAM_PUBLIC_BASE_URL to an address your Plex clients can reach."
+                    if ("127.0.0.1" in url or "localhost" in url) else ""),
+    }
+
+
+def run_strm_job(job_id: str, payload: dict, label: str = "strm") -> None:
+    """The no-download job: scrape, write the .strm, done in about a second."""
+    try:
+        update_job(job_id, status="searching", action=label)
+        info = add_strm(payload)
+        update_job(job_id, status="done", action=label, file=info["strm"], strm=info,
+                   source={"mode": "strm", "candidates": info["candidates"],
+                           "host": play_base_url()})
+        if info.get("warning"):
+            update_job(job_id, warning=info["warning"])
+    except Exception as exc:  # noqa: BLE001
+        log(f"job {job_id}: strm FAILED - {exc}")
+        update_job(job_id, status="failed", action=label, error=str(exc))
+
 
 def new_job(payload: dict) -> str:
     job_id = uuid.uuid4().hex[:12]
@@ -689,26 +959,40 @@ def run_seerr_job(job_id: str, payload: dict, terminal: bool = True) -> dict | N
         return None
 
 
+def instant_runner(action: str) -> str:
+    """Which no-Seerr path gives you the picture fastest: a download or a play-through?"""
+    return "strm" if action == "strm" or DEFAULT_ACTION == "strm" else "stream"
+
+
 def dispatch_job(job_id: str, payload: dict, action: str) -> None:
-    """Route a job to Seerr, to the stream downloader, or to both."""
+    """Route a job: download it, point at it (no download), request it, or request+play."""
     if action == "seerr":
         run_seerr_job(job_id, payload)
         return
+    if action == "strm":
+        run_strm_job(job_id, payload)
+        return
     if action == "both":
         # Request first: it is the cheap call, and it is the one that gets you a permanent
-        # copy. If Seerr is unavailable we say so on the job but still stream now.
+        # copy. If Seerr is unavailable we say so on the job but still make it watchable.
         run_seerr_job(job_id, payload, terminal=False)
         update_job(job_id, action="both", status="queued")
-        run_job(job_id, payload)
+        if instant_runner("both") == "strm":
+            run_strm_job(job_id, payload, label="both")   # no download: play through
+        else:
+            run_job(job_id, payload)
+        update_job(job_id, action="both")
         return
     run_job(job_id, payload)
 
 
 def resolve_action(payload: dict, action: str = "") -> str:
-    """Per-request 'action' wins; otherwise fall back to SEERR_MODE."""
+    """Per-request 'action' wins, then TELESTREAM_ACTION, then SEERR_MODE."""
     act = (action or payload.get("action") or "").strip().lower()
-    if act in ("stream", "seerr", "both"):
+    if act in ACTIONS:
         return act
+    if DEFAULT_ACTION in ACTIONS:
+        return DEFAULT_ACTION
     if SEERR_MODE == "request":
         return "seerr"
     if SEERR_MODE == "both":
@@ -734,6 +1018,8 @@ def dashboard_html() -> str:
                        if fc_ready else "not configured"),
         "Ranking": f"prefer={FASTCOMBO_PREFER} · up to {FASTCOMBO_MAX_FALLBACKS} fallbacks",
         "Title search": CINEMETA_URL or "(Cinemeta)",
+        "Play-through": (f"{play_base_url()}/play/&lt;key&gt;.mkv · cache "
+                         f"{CACHE_DIR} ({CACHE_MAX_BYTES / 1024 ** 3:.0f} GB cap)"),
         "Staging": STAGING,
         "Movies library": MOVIES_DIR,
         "TV library": TV_DIR,
@@ -862,7 +1148,11 @@ _PAGE = """<!doctype html>
       <button class="ghost sm" id="reload" type="button">Re-query</button>
       <button class="ghost sm" id="reqseerr" type="button"
               title="Ask Seerr to have Radarr/Sonarr download this to your server (no debrid)">Request in Seerr</button>
-      <button class="sm" id="fetchbest" type="button" style="margin-left:auto">Fetch best into Plex</button>
+      <span style="margin-left:auto;display:flex;gap:6px">
+        <button class="ghost sm" id="addstrm" type="button"
+                title="No download: add a pointer that scrapes a fresh link and streams it through the bridge cache">Add without downloading</button>
+        <button class="sm" id="fetchbest" type="button">Fetch best into Plex</button>
+      </span>
     </div>
     <table><thead><tr><th>Pick</th><th>Quality</th><th>Size</th><th>Speed</th><th>From</th><th></th></tr></thead>
       <tbody id="srows"></tbody></table>
@@ -983,6 +1273,7 @@ $('reload').addEventListener('click', loadStreams);
 $('season').addEventListener('change', loadStreams);
 $('episode').addEventListener('change', loadStreams);
 $('fetchbest').addEventListener('click', ()=>fetchNow({}));
+$('addstrm').addEventListener('click', ()=>fetchNow({action:'strm'}));
 if(SEERR_ON){
   $('reqseerr').addEventListener('click', ()=>requestSeerr(chosen
     ? {id:chosen.id, type:chosen.type, name:chosen.name, year:chosen.year} : {}));
@@ -1051,16 +1342,23 @@ async function refreshJobs(){
       const p=j.payload||{}, s=j.source||{};
       const t = (p.title||j.imdb||'?')+(p.year?' ('+p.year+')':'')+(p.episode?' '+p.episode:'');
       const isSeerr = j.action==='seerr';
+      const isStrm = s.mode==='strm';
       const src = s.mode==='fastcombo'
         ? [s.resolution, gb(s.size_bytes), s.start_seconds!=null?s.start_seconds.toFixed(1)+'s':'',
            s.source, s.addon].filter(Boolean).join(' · ')
-        : isSeerr ? 'Seerr → Radarr/Sonarr' : (s.mode||'—');
+        : isSeerr ? 'Seerr → Radarr/Sonarr'
+        : isStrm ? 'play-through · '+s.candidates+' live link(s)'
+        : (s.mode||'—');
       const seerrTxt = j.seerr
         ? '<div class="m">seerr: '+esc(j.seerr.title||'')+(j.seerr.tmdb_id?' tmdb '+esc(j.seerr.tmdb_id):'')
           +' · '+esc(j.seerr.status_label||'')+(j.seerr.message?' · '+esc(j.seerr.message):'')+'</div>'
         : j.seerr_error ? '<div class="m">seerr failed: '+esc(String(j.seerr_error).slice(0,140))+'</div>' : '';
       const res = j.status==='done'
                 ? (isSeerr ? '<span class="pill">requested in Seerr</span>'
+                  : isStrm ? '<code>'+esc(j.file||'')+'</code>'
+                           +' <span class="pill">no download</span>'
+                           +'<div class="m">plays via '+esc((j.strm||{}).play_url||'')+'</div>'
+                           +(j.warning?'<div class="m">'+esc(j.warning)+'</div>':'')
                            : '<code>'+esc(j.file||'')+'</code>')
                 + (j.skipped?' <span class="pill">'+(isSeerr?'already in library':'already had it')+'</span>':'')
                 + (j.attempt>1?' <span class="pill">used fallback #'+j.attempt+'</span>':'')
@@ -1105,6 +1403,183 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
+    # ---- play-through streaming ----------------------------------------------
+    def _send_cached(self, path: str) -> None:
+        """Serve a finished cache file, honouring Range like any media server would."""
+        size = os.path.getsize(path)
+        start, end, status = 0, size - 1, 200
+        match = re.match(r"\s*bytes=(\d*)-(\d*)", self.headers.get("Range") or "")
+        if match and (match.group(1) or match.group(2)):
+            status = 206
+            if match.group(1):
+                start = int(match.group(1))
+                if match.group(2):
+                    end = min(int(match.group(2)), size - 1)
+            else:                                   # suffix range: the last N bytes
+                start = max(0, size - int(match.group(2)))
+        if start >= size or start > end:
+            self.send_response(416)
+            self.send_header("Content-Range", f"bytes */{size}")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        length = end - start + 1
+        self.send_response(status)
+        self.send_header("Content-Type", "video/x-matroska")
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(length))
+        if status == 206:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        self.end_headers()
+        remaining, sent = length, 0
+        with open(path, "rb") as handle:
+            handle.seek(start)
+            while remaining > 0:
+                block = handle.read(min(CHUNK, remaining))
+                if not block:
+                    break
+                self.wfile.write(block)
+                remaining -= len(block)
+                sent += len(block)
+        log(f"play: served {sent / 1024 ** 2:.1f} MB from cache ({os.path.basename(path)})")
+
+    def _stream_upstream(self, key: str) -> None:
+        """
+        Scrape a fresh link and stream it straight through to Plex, caching as we go.
+        Fails over to the next candidate if a host will not open -- all of that happens
+        BEFORE any header is sent, so the client never sees a half-formed response.
+        """
+        entry = play_entry(key)
+        candidates = entry["candidates"]
+        want_range = (self.headers.get("Range") or "").strip()
+        from_zero = (not want_range) or bool(re.match(r"bytes=0-$", want_range))
+        final, part = cache_path(key, True), cache_path(key, False)
+        errors: list[str] = []
+
+        for n, cand in enumerate(candidates, start=1):
+            request = urllib.request.Request(cand.url)
+            for header, value in (getattr(cand, "headers", None) or {}).items():
+                request.add_header(header, value)
+            if want_range:
+                request.add_header("Range", want_range)
+            request.add_header("User-Agent",
+                               "Mozilla/5.0 (X11; Linux x86_64) Mwatcher-playthrough/1.0")
+            try:
+                upstream = urllib.request.urlopen(request, timeout=PLAY_TIMEOUT)
+            except Exception as exc:  # noqa: BLE001 - try the next candidate
+                errors.append(f"#{n} {getattr(cand, 'res_label', '') or ''}: {exc}")
+                log(f"play {key}: candidate {n}/{len(candidates)} would not open ({exc})")
+                continue
+
+            with upstream:
+                code = upstream.status if upstream.status in (200, 206) else 200
+                length_header = upstream.headers.get("Content-Length") or ""
+                content_range = upstream.headers.get("Content-Range") or ""
+
+                # Sniff before committing a single header: if this host is serving a
+                # captcha/login/error page instead of video, we can still fail over to the
+                # next candidate. Once headers go out, that option is gone and Plex would
+                # happily try to play HTML -- which is exactly error s1001.
+                first = upstream.read(CHUNK)
+                upstream_type = (upstream.headers.get("Content-Type") or "").lower()
+                marker = sniff_html(first) if from_zero else None
+                if marker or (from_zero and upstream_type.startswith(("text/html",
+                                                                     "application/json"))):
+                    why = (f"content-type {upstream_type}" if not marker
+                           else f"found {marker!r} in the first bytes")
+                    errors.append(f"#{n} {getattr(cand, 'res_label', '') or ''}: "
+                                  f"not a video ({why})")
+                    log(f"play {key}: candidate {n}/{len(candidates)} served a web page, "
+                        f"not a video ({why}) -- trying the next one")
+                    continue
+
+                self.send_response(code)
+                self.send_header("Content-Type",
+                                 upstream.headers.get("Content-Type") or "video/x-matroska")
+                self.send_header("Accept-Ranges", "bytes")
+                if length_header:
+                    self.send_header("Content-Length", length_header)
+                if content_range:
+                    self.send_header("Content-Range", content_range)
+                self.send_header("X-Mwatcher-Stream",
+                                 f"scraped live, candidate {n}/{len(candidates)}")
+                self.end_headers()
+
+                caching = bool(CACHE_ENABLED and from_zero and code in (200, 206))
+                handle = None
+                if caching:
+                    os.makedirs(CACHE_DIR, exist_ok=True)
+                    handle = open(part, "wb")
+                total = 0
+                try:
+                    if first:                      # the chunk we sniffed is real media
+                        if handle:
+                            handle.write(first)
+                        self.wfile.write(first)
+                        total += len(first)
+                    while True:
+                        block = upstream.read(CHUNK)
+                        if not block:
+                            break
+                        if handle:
+                            handle.write(block)
+                        self.wfile.write(block)
+                        total += len(block)
+                except (BrokenPipeError, ConnectionResetError):
+                    log(f"play {key}: client stopped after {total / 1024 ** 2:.1f} MB")
+                    if handle:
+                        handle.close()
+                        handle = None
+                        try:
+                            os.remove(part)     # a partial cache cannot be resumed safely
+                        except OSError:
+                            pass
+                    return
+                if handle:
+                    handle.close()
+                    complete = length_header.isdigit() and total >= int(length_header)
+                    if complete:
+                        os.replace(part, final)
+                        os.chmod(final, 0o644)
+                        evict_cache()
+                        log(f"play {key}: streamed {total / 1024 ** 2:.1f} MB and cached it")
+                    else:
+                        try:
+                            os.remove(part)
+                        except OSError:
+                            pass
+                        log(f"play {key}: streamed {total / 1024 ** 2:.1f} MB "
+                            f"(incomplete, not cached)")
+                else:
+                    log(f"play {key}: streamed {total / 1024 ** 2:.1f} MB")
+                return
+
+        raise RuntimeError("every scraped link failed: " + " | ".join(errors[-3:]))
+
+    def _serve_play(self, path: str) -> None:
+        key = re.sub(r"\.(mkv|mp4|webm|avi)$", "", os.path.basename(path))
+        try:
+            play_entry(key)
+        except KeyError:
+            self._send(404, {"error": f"unknown play key '{key}' -- create one with POST /add"})
+            return
+        final = cache_path(key, True)
+        if os.path.exists(final):
+            try:
+                self._send_cached(final)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
+        try:
+            resolve_for_play(key)          # scrape a fresh link at play time
+            self._stream_upstream(key)
+        except Exception as exc:  # noqa: BLE001
+            log(f"play {key}: FAILED - {exc}")
+            try:
+                self._send(502, {"error": f"could not play '{key}': {exc}"})
+            except Exception:              # headers may already be gone; nothing to do
+                pass
+
     def do_GET(self) -> None:  # noqa: N802
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
@@ -1112,6 +1587,14 @@ class Handler(BaseHTTPRequestHandler):
 
         if path in ("/", "/index.html", "/ui"):
             self._send_html(200, dashboard_html())
+        elif path.startswith("/play/"):
+            # Plex asks for this: scrape a fresh link and stream it through (with cache).
+            self._serve_play(path)
+        elif path == "/cache":
+            self._send(200, cache_stats())
+        elif path == "/plays":
+            self._send(200, {"count": len(PLAY), "base_url": play_base_url(),
+                             "plays": play_list()})
         elif path == "/healthz":
             self._send(200, {"ok": True, "fastcombo": bool(FASTCOMBO_ACCESS_KEY),
                             "stremio_source": stremio_source is not None,
@@ -1132,6 +1615,12 @@ class Handler(BaseHTTPRequestHandler):
                 "resolver_url": RESOLVER_URL,
                 "seerr_url": SEERR_URL, "seerr_ready": seerr_ready(),
                 "seerr_mode": SEERR_MODE, "seerr_is4k": SEERR_IS4K,
+                "default_action": resolve_action({}),
+                "play_base_url": play_base_url(),
+                "cache_dir": CACHE_DIR, "cache_enabled": CACHE_ENABLED,
+                "cache_max_gb": round(CACHE_MAX_BYTES / 1024 ** 3, 2),
+                "cache_used_gb": round(cache_stats()["used_gb"], 3),
+                "resolve_ttl_seconds": RESOLVE_TTL,
             })
         elif path == "/seerr":
             # Is Seerr reachable, and what is queued for download right now?
@@ -1197,13 +1686,14 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception as exc:  # noqa: BLE001
                     self._send(502, {"ok": False, "error": str(exc)})
         else:
-            self._send(404, {"error": "try GET /jobs, /seerr, /search?q=, /streams?id=tt... "
-                                     "or POST /fetch (stream now) / POST /request (ask Seerr)"})
+            self._send(404, {"error": "try GET /jobs, /plays, /cache, /seerr, /search?q=, "
+                                     "/streams?id=tt... or POST /fetch, /add, /request"})
 
     def do_POST(self) -> None:  # noqa: N802
         path = urllib.parse.urlparse(self.path).path
-        if path not in ("/fetch", "/request"):
-            self._send(404, {"error": "POST /fetch (stream now) or POST /request (ask Seerr)"})
+        if path not in ("/fetch", "/request", "/add"):
+            self._send(404, {"error": "POST /fetch (download), POST /add (play-through .strm, "
+                                      "no download) or POST /request (ask Seerr)"})
             return
         try:
             length = int(self.headers.get("Content-Length") or 0)
@@ -1212,6 +1702,16 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("body must be a JSON object")
         except Exception as exc:  # noqa: BLE001
             self._send(400, {"error": f"bad JSON: {exc}"})
+            return
+
+        if path == "/add":
+            # Play-through: no download. Writes a .strm that Plex plays via /play/<key>.
+            try:
+                info = add_strm(payload)
+            except Exception as exc:  # noqa: BLE001
+                self._send(502, {"ok": False, "error": str(exc)})
+                return
+            self._send(200, {"ok": True, "action": "strm", "downloaded_bytes": 0, **info})
             return
 
         if path == "/request":
@@ -1289,9 +1789,16 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--stream", help="same as --url but skip the local resolver")
     parser.add_argument("--dest", help="override destination folder (skips Plex naming rules)")
     # Seerr: request a title so Radarr/Sonarr download it to your server
-    parser.add_argument("--action", choices=["stream", "seerr", "both"],
-                        help="stream (download the best addon stream), seerr (create a Seerr "
-                             "request only), or both. Default comes from SEERR_MODE.")
+    parser.add_argument("--action", choices=list(ACTIONS),
+                        help="stream (download the best addon stream), strm (NO download: "
+                             "write a .strm that plays through this bridge's cache), seerr "
+                             "(create a Seerr request only), or both (Seerr request plus the "
+                             "instant path). Default: TELESTREAM_ACTION, else SEERR_MODE.")
+    parser.add_argument("--add", action="store_true",
+                        help="same as --action strm: add the title without downloading it")
+    parser.add_argument("--public-url",
+                        help="base URL your Plex CLIENTS can reach this bridge at, written "
+                             "into .strm files (overrides TELESTREAM_PUBLIC_BASE_URL)")
     parser.add_argument("--seasons", help='for a Seerr TV request: "all", "missing", or "1,3"')
     parser.add_argument("--4k", dest="is4k", action="store_true",
                         help="request the 4K variant in Seerr (needs a 4K server configured there)")
@@ -1306,6 +1813,8 @@ def main(argv: list[str]) -> int:
     if args.serve == "serve":
         serve()
         return 0
+    if args.add:
+        args.action = "strm"
     want_action = (args.action or "").strip().lower() or (
         "seerr" if SEERR_MODE == "request" else "both" if SEERR_MODE == "both" else "stream")
     if stremio_source is None and not (args.url or args.stream) and want_action != "seerr":
@@ -1355,9 +1864,21 @@ def main(argv: list[str]) -> int:
     if not direct and not (args.imdb or args.title):
         parser.error("need --imdb or --title (Fast Combo lookup), or --url/--stream (direct link), "
                      "or the 'serve' subcommand")
-    if want_action in ("seerr", "both") and not seerr_ready():
-        parser.error("--action " + want_action + " needs SEERR_URL and SEERR_API_KEY "
+    if want_action in ("seerr",) and not seerr_ready():
+        parser.error("--action seerr needs SEERR_URL and SEERR_API_KEY "
                      "(the key is in Seerr -> Settings -> General)")
+    if want_action == "both" and not seerr_ready():
+        parser.error("--action both needs SEERR_URL and SEERR_API_KEY "
+                     "(the key is in Seerr -> Settings -> General)")
+    if want_action in ("strm", "both") and instant_runner(want_action) == "strm":
+        global PUBLIC_BASE_URL  # noqa: PLW0603
+        if args.public_url:
+            PUBLIC_BASE_URL = args.public_url.rstrip("/")
+        if "127.0.0.1" in play_base_url() or "localhost" in play_base_url():
+            print("warning: .strm will point at loopback, so only THIS machine can play it.\n"
+                  "         Set TELESTREAM_PUBLIC_BASE_URL (or --public-url) to the address\n"
+                  "         your Plex clients use, e.g. http://192.168.0.34:8889",
+                  file=sys.stderr)
 
     payload = {
         "title": args.title or "",
@@ -1371,6 +1892,7 @@ def main(argv: list[str]) -> int:
         "dest": args.dest,
         "action": want_action,
         "seasons": args.seasons or "",
+        "public_url": args.public_url or "",
         "is4k": True if args.is4k else None,
     }
     if args.stream:

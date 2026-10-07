@@ -88,6 +88,23 @@ EnvironmentFile=/home/afine/.config/mwatcher/bridge.env
 # Leave empty -- Fast Combo is the source now.
 #Environment=TELESTREAM_RESOLVER_URL=http://127.0.0.1:8888/resolve?url={url}
 
+# --- play-through: add titles WITHOUT downloading them --------------------------------
+# The library gets a tiny .strm pointer instead of a file. When Plex plays it, the bridge
+# scrapes a FRESH link from your addons at that moment, opens it with whatever headers the
+# host needs, streams the bytes through (Range-aware, so seeking works) and keeps a capped
+# cache. Links never go stale, and the library costs a few hundred bytes per title.
+#
+# TELESTREAM_PUBLIC_BASE_URL is the one that matters: it is the address written into the
+# .strm, and it must be reachable from your Plex CLIENTS -- not from this server. Leave it
+# unset and you get the LAN IP; pointing it at 127.0.0.1 gives every remote device s1001.
+#Environment=TELESTREAM_ACTION=stream
+#Environment=TELESTREAM_PUBLIC_BASE_URL=http://192.168.0.34:8889
+#Environment=TELESTREAM_CACHE_DIR=/home/afine/media/cache
+#Environment=TELESTREAM_CACHE_MAX_GB=20
+#Environment=TELESTREAM_CACHE=1
+#Environment=TELESTREAM_RESOLVE_TTL=300
+#Environment=TELESTREAM_PLAY_TIMEOUT=30
+
 # --- verifying downloads --------------------------------------------------------------
 # A host that returns an HTML error page instead of a video is the #1 cause of Plex
 # error "s1001 (Network)": the filename matches so the title appears in your library,

@@ -24,7 +24,7 @@ your Stremio addons ──▶ Fast Combo ──▶ Mwatcher bridge ──▶ sta
 |---|---|
 | `docs/PLEX_GLOBAL_ACCESS.md` | **The full guide** — installing Plex on Lubuntu, running Fast Combo + the bridge, how the "best stream" is chosen, and reaching it all from anywhere (port forwarding, Cloudflare Tunnel, Tailscale/CGNAT) |
 | `install.sh` | **One command** to install/repair everything, plus `status`, `doctor` (diagnoses playback failures), `seerr` and `uninstall` |
-| `scripts/telestream_to_plex.py` | The bridge: dashboard + HTTP API + CLI. Resolve → download → name → library |
+| `scripts/telestream_to_plex.py` | The bridge: dashboard + HTTP API + CLI. Resolve → download **or** stream through a cache → name → library |
 | `scripts/stremio_source.py` | Fast Combo / Cinemeta client: parses and ranks addon streams, picks the best |
 | `scripts/seerr_source.py` | Seerr client: search → TMDB id → create a request, plus `--doctor` for the request path |
 | `services/seerr-stack/docker-compose.yml` | Seerr + Radarr + Sonarr + Prowlarr + qBittorrent, all sharing one media path |
@@ -148,18 +148,36 @@ python3 scripts/seerr_source.py --doctor --url http://127.0.0.1:5055 --api-key t
 - Plex Media Server, plus **Plex Pass** for remote playback in mobile/TV apps
   (remote playback in a web browser works without it)
 
-## Two ways to get a title
+## Three ways to get a title
 
-| | **Stream it now** (Fast Combo) | **Request it** (Seerr) |
-|---|---|---|
-| What happens | your addons are queried, the single best link is downloaded into the library | Seerr → Radarr/Sonarr → Prowlarr → qBittorrent put a proper release in the library |
-| Needs | Fast Combo + your addons | Docker + the Seerr stack + indexers |
-| Debrid needed | only for torrent-only links (the bridge skips those) | **no** — torrents/NZBs do the fetching |
-| Speed to watching | seconds to minutes | as long as the download takes |
-| Survives link rot | no — re-fetch if a host dies | yes, the file is yours |
+| | **Play through**<br>`action=strm` | **Download**<br>`action=stream` | **Request**<br>`action=seerr` |
+|---|---|---|---|
+| What lands in the library | a 45-byte `.strm` pointer | the video file | nothing yet — Seerr queues it |
+| Who fetches the bytes | the bridge, at play time | the bridge, now | Radarr/Sonarr → qBittorrent |
+| Disk used | a capped cache (default 20 GB, evicts oldest) | the whole title, forever | the whole title, forever |
+| Debrid needed | no | only for torrent-only links (skipped) | **no** — torrents/NZBs fetch it |
+| Time to watching | seconds | as long as the download takes | as long as the download takes |
+| Survives link rot | links are re-scraped every play | no — re-fetch if a host dies | yes, the file is yours |
 
-`action` picks per request: `stream`, `seerr`, or `both` — and `both` is the useful one:
-you start watching from an addon stream immediately while the permanent copy downloads.
+Play-through is the "don't download anything" mode: Plex asks the bridge, the bridge scrapes
+a **fresh** link from your addons right then, opens it with whatever headers the host needs,
+and streams it through (Range-aware, so seeking works) into a capped cache. A host serving a
+captcha page is caught before the first byte reaches Plex and the next link is tried — the
+same protection the download path has.
+
+```bash
+curl -X POST localhost:8889/add    -d '{"title":"Dune","year":2021}'   # pointer, 0 bytes
+curl -X POST localhost:8889/fetch  -d '{"title":"Dune","year":2021}'   # download it
+curl -X POST localhost:8889/request -d '{"title":"Dune","year":2021}'  # Seerr gets it
+curl -X POST localhost:8889/fetch  -d '{"title":"Dune","action":"both"}'  # watch now + own it
+curl -s  localhost:8889/plays      # pointers + what is cached
+curl -s  localhost:8889/cache      # cache size vs cap
+```
+
+`TELESTREAM_ACTION=strm` makes play-through the default, and `SEERR_MODE=both` makes every
+fetch also create a Seerr request. `TELESTREAM_PUBLIC_BASE_URL` is the address written into
+the `.strm` — it must be reachable from your **Plex clients**, not from the server; loopback
+there means s1001 on every other device.
 
 ```bash
 sudo bash install.sh seerr                        # one command for the whole stack
@@ -173,7 +191,7 @@ curl -s localhost:8889/seerr                      # reachable? what's queued?
 
 Note that Seerr itself never downloads — it delegates to Radarr/Sonarr, which is why the
 installer brings up that stack too. Details, configuration order and "my request never
-became a file" in `docs/PLEX_GLOBAL_ACCESS.md` §4.6.
+became a file" in `docs/PLEX_GLOBAL_ACCESS.md` §4.7.
 
 ## Trade-off, plainly
 
@@ -182,6 +200,7 @@ time (a 4K movie is 15-25 GB). In exchange you get the best available copy, corr
 named, playable on every Plex client, with Plex's own transcoding, subtitles, resume
 positions and sharing. See `docs/PLEX_GLOBAL_ACCESS.md` §4.5.
 
-If you would rather not have the bridge download at all, use Seerr (§4.6): request a title
+Do not want files at all? Use play-through (§4.6) — a 45-byte pointer and a capped cache.
+Want them fetched properly instead of scraped? Use Seerr (§4.7): request a title
 and Radarr/Sonarr fetch it via your own indexers — no debrid subscription, and the release
 is chosen by quality profile rather than by whatever an addon happens to have.

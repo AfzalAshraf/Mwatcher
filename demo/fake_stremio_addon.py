@@ -127,10 +127,14 @@ class Handler(BaseHTTPRequestHandler):
     def _serve_file(self, delay_ms: int) -> None:
         # DEMO_TRAP simulates the nastiest real-world failure: a host that answers the
         # Range probe like a video (so Fast Combo keeps it) but serves an HTML error page
-        # on the actual download. This is what makes Plex show a title that fails with
-        # "s1001 (Network)" -- and what the bridge's validation now catches.
+        # when you actually ask for the content. This is what makes Plex show a title that
+        # fails with "s1001 (Network)" -- and what the bridge's validation now catches.
+        # The probe (bytes=0-1) passes; anything that wants real bytes gets the wall,
+        # which is how these hosts behave whether you download or stream through.
         trap = os.environ.get("DEMO_TRAP", "")
-        if trap and f"-{trap}." in self.path and not self.headers.get("Range"):
+        wanted_range = (self.headers.get("Range") or "").strip()
+        is_probe = wanted_range in ("bytes=0-1", "bytes=0-0", "bytes=0-2")
+        if trap and f"-{trap}." in self.path and not is_probe:
             body = (b"<!DOCTYPE html>\n<html><head><title>Just a moment...</title></head>\n"
                     b"<body><h1>Checking your browser</h1><p>Please enable JavaScript to continue.</p>"
                     b"</body></html>\n")
