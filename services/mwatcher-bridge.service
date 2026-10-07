@@ -60,7 +60,22 @@ Environment=FASTCOMBO_MAX_FALLBACKS=4
 Environment=CINEMETA_URL=https://v3-cinemeta.strem.io
 
 # FC_ACCESS_KEY (and optionally FASTCOMBO_TOKEN) live here, chmod 600:
+# SEERR_API_KEY goes in the same file -- it is an ADMIN credential, so keep it chmod 600.
 EnvironmentFile=/home/afine/.config/mwatcher/bridge.env
+
+# --- Seerr: request a title and your own server downloads it (no debrid) ---------------
+# Bring the whole stack up with:  sudo bash install.sh seerr
+# Seerr never downloads itself -- it hands the request to Radarr/Sonarr, which use
+# Prowlarr (indexers) + qBittorrent to put real files in the library.
+# SEERR_MODE:
+#   off      never contact Seerr (default)
+#   request  only create a Seerr request -- the bridge downloads nothing
+#   both     create the request AND stream now, so you watch immediately while the
+#            permanent copy is fetched in the background
+#Environment=SEERR_URL=http://127.0.0.1:5055
+#Environment=SEERR_MODE=off
+#Environment=SEERR_IS4K=0
+#Environment=SEERR_TV_SEASONS=all
 
 # --- the downloader --------------------------------------------------------------------
 # Placeholders {stream} {out} {headers} are substituted ALREADY SHELL-QUOTED, so use them

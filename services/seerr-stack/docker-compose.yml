@@ -1,0 +1,136 @@
+# =============================================================================
+#  Seerr stack -- request a title and your own server downloads it (no debrid)
+# =============================================================================
+#
+#   Seerr (5055)  the request/approval UI you browse
+#      |
+#      +-> Radarr (7878)  movies      \   both ask Prowlarr for a release,
+#      +-> Sonarr (8989)  TV shows    /   then hand it to qBittorrent
+#             |
+#             +-> Prowlarr (9696)      indexer manager: your torrent/NZB sites
+#             +-> qBittorrent (8080)   does the actual downloading
+#                     |
+#                     +-> /media/Movies, /media/TV Shows  ->  Plex sees the files
+#
+#  PATHS ARE THE POINT. Every container mounts your library at the *same* path
+#  (/media) and downloads at the same path (/downloads), so Radarr, Sonarr and
+#  qBittorrent all agree on where a file is. That avoids the classic
+#  "remote path mapping" misconfiguration that leaves downloads stuck in the
+#  queue with "import failed / path does not exist".
+#
+#  Bring it up with:   sudo bash install.sh seerr
+#  (that writes .env with your real uid/gid/timezone/paths, creates the folders,
+#   installs Docker if needed, and prints the configuration order below.)
+#
+#  CONFIGURATION ORDER after `docker compose up -d` -- it matters:
+#    1. qBittorrent  http://<ip>:8080   set a real password (default admin/adminadmin)
+#    2. Prowlarr     http://<ip>:9696   add your indexers, then Settings -> Apps ->
+#                                       add Radarr and Sonarr (host: radarr / sonarr)
+#    3. Radarr       http://<ip>:7878   Settings -> Download Clients -> qBittorrent
+#                                       (host: qbittorrent, port 8080);
+#                                       Settings -> Media Management -> root folder /media/Movies
+#    4. Sonarr       http://<ip>:8989   same, root folder /media/TV Shows
+#    5. Seerr        http://<ip>:5055   first run wizard -> Plex (host:
+#                                       host.docker.internal, port 32400) ->
+#                                       add Radarr + Sonarr servers -> grab the
+#                                       API key from Settings -> General and put it
+#                                       in ~/.config/mwatcher/bridge.env as SEERR_API_KEY
+# =============================================================================
+
+name: mwatcher-seerr
+
+services:
+  seerr:
+    image: fallenbagel/seerr:latest
+    container_name: seerr
+    environment:
+      - LOG_LEVEL=info
+      - TZ=${TZ}
+    volumes:
+      - ${STACK_DIR}/seerr/config:/app/config
+    ports:
+      - "${SEERR_PORT}:5055"
+    # Lets Seerr reach Plex running on the host (apt-installed) by a stable name.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  radarr:
+    image: lscr.io/linuxserver/radarr:latest
+    container_name: radarr
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    volumes:
+      - ${STACK_DIR}/radarr/config:/config
+      - ${MEDIA_DIR}:/media
+      - ${DOWNLOADS_DIR}:/downloads
+    ports:
+      - "${RADARR_PORT}:7878"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  sonarr:
+    image: lscr.io/linuxserver/sonarr:latest
+    container_name: sonarr
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    volumes:
+      - ${STACK_DIR}/sonarr/config:/config
+      - ${MEDIA_DIR}:/media
+      - ${DOWNLOADS_DIR}:/downloads
+    ports:
+      - "${SONARR_PORT}:8989"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  prowlarr:
+    image: lscr.io/linuxserver/prowlarr:latest
+    container_name: prowlarr
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    volumes:
+      - ${STACK_DIR}/prowlarr/config:/config
+    ports:
+      - "${PROWLARR_PORT}:9696"
+    restart: unless-stopped
+
+  qbittorrent:
+    image: lscr.io/linuxserver/qbittorrent:latest
+    container_name: qbittorrent
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+      - WEBUI_PORT=${QBT_PORT}
+      - TORRENTING_PORT=${QBT_TORRENT_PORT}
+    volumes:
+      - ${STACK_DIR}/qbittorrent/config:/config
+      - ${DOWNLOADS_DIR}:/downloads
+    ports:
+      - "${QBT_PORT}:${QBT_PORT}"
+      - "${QBT_TORRENT_PORT}:${QBT_TORRENT_PORT}"
+      - "${QBT_TORRENT_PORT}:${QBT_TORRENT_PORT}/udp"
+    restart: unless-stopped
+
+  # Optional subtitles. Uncomment once Radarr/Sonarr work.
+  # bazarr:
+  #   image: lscr.io/linuxserver/bazarr:latest
+  #   container_name: bazarr
+  #   environment:
+  #     - PUID=${PUID}
+  #     - PGID=${PGID}
+  #     - TZ=${TZ}
+  #   volumes:
+  #     - ${STACK_DIR}/bazarr/config:/config
+  #     - ${MEDIA_DIR}:/media
+  #   ports:
+  #     - "6767:6767"
+  #   restart: unless-stopped

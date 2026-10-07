@@ -139,6 +139,49 @@ do_status() {
                          || bad "MISMATCH: bridge.env key ≠ fastcombo.env key — lookups will 404"
   fi
 
+  printf '\n%sSeerr  (request a title -> your server downloads it)%s\n' "$B" "$R"
+  local surl="" skey=""
+  if [ -f "$CONFIG_DIR/bridge.env" ]; then
+    surl="$(grep -E '^SEERR_URL=' "$CONFIG_DIR/bridge.env" 2>/dev/null | head -1 | cut -d= -f2- || true)"
+    skey="$(grep -E '^SEERR_API_KEY=' "$CONFIG_DIR/bridge.env" 2>/dev/null | head -1 | cut -d= -f2- || true)"
+  fi
+  if [ -z "$surl" ]; then
+    info "not configured (optional) — 'sudo bash install.sh seerr' sets up Seerr + Radarr/Sonarr"
+    info "                                  + Prowlarr + qBittorrent, so requests download locally"
+  else
+    local sport="5055"
+    case "$surl" in *:*) sport="${surl##*:}"; sport="${sport%%/*}" ;; esac
+    [[ "$sport" =~ ^[0-9]+$ ]] || sport="5055"
+    ok "SEERR_URL=$surl"
+    if [ -n "$skey" ]; then ok "SEERR_API_KEY set (${#skey} chars)"
+    else bad "SEERR_API_KEY is empty — copy it from Seerr -> Settings -> General"; fi
+    if port_open "$sport"; then
+      ok "Seerr is listening on port $sport"
+      if [ -n "$skey" ]; then
+        curl -s -m 8 -H "X-Api-Key: $skey" "$surl/api/v1/settings/about" 2>/dev/null | grep -q '"version"' \
+          && ok "Seerr accepts that API key" \
+          || bad "Seerr rejected the API key — Settings -> General -> API Key"
+      fi
+    else
+      bad "nothing listening on port $sport"
+      info "cd \$HOME/mwatcher-seerr && docker compose up -d   (or: sudo bash install.sh seerr)"
+    fi
+    if have docker; then
+      local up
+      up="$(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^(seerr|radarr|sonarr|prowlarr|qbittorrent)$' | sort | tr '\n' ' ' || true)"
+      if [ -n "${up// /}" ]; then
+        ok "stack containers running: ${up% }"
+        local missing
+        for d in seerr radarr sonarr prowlarr qbittorrent; do
+          echo "$up" | grep -qw "$d" || missing="$missing $d"
+        done
+        [ -n "${missing:-}" ] && warn "not running:$missing" || true
+      else
+        warn "no Seerr-stack containers are running"
+      fi
+    fi
+  fi
+
   printf '\n%sLibrary contents%s\n' "$B" "$R"
   local nmovies ntv
   nmovies="$(find "$MEDIA_DIR/Movies" -type f \( -iname '*.mkv' -o -iname '*.mp4' -o -iname '*.strm' \) 2>/dev/null | wc -l || echo 0)"
@@ -371,6 +414,27 @@ do_doctor() {
        hostname, Secure connections = Preferred, and the LAN URL first in Custom server access URLs."
   fi
 
+  # ---- 6. Seerr request path (only when it is configured) ------------------
+  local surl="" skey=""
+  if [ -f "$CONFIG_DIR/bridge.env" ]; then
+    surl="$(grep -E '^SEERR_URL=' "$CONFIG_DIR/bridge.env" 2>/dev/null | head -1 | cut -d= -f2- || true)"
+    skey="$(grep -E '^SEERR_API_KEY=' "$CONFIG_DIR/bridge.env" 2>/dev/null | head -1 | cut -d= -f2- || true)"
+  fi
+  if [ -n "$surl" ]; then
+    hdr "6. Seerr (request a title -> your server downloads it)"
+    if [ -n "$REPO_DIR" ] && [ -f "$REPO_DIR/scripts/seerr_source.py" ] && have python3; then
+      local n=0
+      SEERR_URL="$surl" SEERR_API_KEY="$skey" \
+        python3 "$REPO_DIR/scripts/seerr_source.py" --doctor --no-summary || n=$?
+      problems=$((problems + n))
+    else
+      warn "cannot run the Seerr check (need python3 and the Mwatcher repo)"
+      port_open "$(printf '%s' "$surl" | sed -E 's#.*:([0-9]+).*#\1#')" \
+        && ok "Seerr answers on that port" || bad "Seerr is not listening on that port"
+      problems=$((problems + 1))
+    fi
+  fi
+
   # ---- verdict -------------------------------------------------------------
   hdr "Verdict"
   if [ "$problems" -eq 0 ]; then
@@ -596,6 +660,167 @@ do_uninstall() {
 }
 
 # =============================================================================
+# =============================================================================
+#  seerr -- request a title and let your own server download it (no debrid)
+# =============================================================================
+#  Brings up Seerr + Radarr + Sonarr + Prowlarr + qBittorrent with Docker, all
+#  sharing ONE media path so imports never fail on path mismatches.
+do_seerr() {
+  need_root "seerr"
+  hdr "Seerr stack  (browse -> request -> your server downloads it)"
+  info "Seerr itself never downloads: it hands requests to Radarr/Sonarr, which use"
+  info "Prowlarr (indexers) + qBittorrent. That is what replaces a debrid service."
+
+  local STACK_SRC=""
+  if [ -n "$REPO_DIR" ] && [ -f "$REPO_DIR/services/seerr-stack/docker-compose.yml" ]; then
+    STACK_SRC="$REPO_DIR/services/seerr-stack/docker-compose.yml"
+  fi
+  [ -n "$STACK_SRC" ] || die "cannot find services/seerr-stack/docker-compose.yml -- run this from inside the Mwatcher repo"
+
+  local STACK_DIR="${SEERR_STACK_DIR:-$RUN_HOME/mwatcher-seerr}"
+  local DL_DIR="${DOWNLOADS_DIR:-$MEDIA_DIR/downloads}"
+  local COMPOSE=""
+
+  # ---- 1. docker -------------------------------------------------------------
+  hdr "1. Docker"
+  if have docker; then
+    ok "docker $(docker --version 2>/dev/null | sed 's/^Docker version //;s/,.*//')"
+  else
+    warn "docker not installed -- installing (Seerr/Radarr/Sonarr only ship as images)"
+    apt-get update -qq || true
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq docker.io >/dev/null 2>&1 || true
+    systemctl enable --now docker >/dev/null 2>&1 || true
+    have docker && ok "docker installed" || die "docker install failed -- install it manually, then re-run"
+  fi
+  if docker compose version >/dev/null 2>&1; then
+    COMPOSE="docker compose"
+    ok "docker compose $(docker compose version --short 2>/dev/null)"
+  elif have docker-compose; then
+    COMPOSE="docker-compose"
+    warn "using the standalone docker-compose binary (the plugin is missing)"
+  else
+    warn "installing the compose plugin"
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq docker-compose-v2 >/dev/null 2>&1 \
+      || DEBIAN_FRONTEND=noninteractive apt-get install -y -qq docker-compose-plugin >/dev/null 2>&1 || true
+    if docker compose version >/dev/null 2>&1; then
+      COMPOSE="docker compose"; ok "docker compose $(docker compose version --short 2>/dev/null)"
+    else
+      die "no docker compose available -- install docker-compose-plugin, then re-run"
+    fi
+  fi
+
+  # ---- 2. folders ------------------------------------------------------------
+  hdr "2. Folders"
+  mkdir -p "$MEDIA_DIR/Movies" "$MEDIA_DIR/TV Shows" "$DL_DIR" "$STACK_DIR"
+  local d
+  for d in seerr radarr sonarr prowlarr qbittorrent; do mkdir -p "$STACK_DIR/$d/config"; done
+  chown -R "$RUN_USER":"$RUN_USER" "$MEDIA_DIR" "$DL_DIR" "$STACK_DIR" 2>/dev/null || true
+  chmod -R a+rX "$MEDIA_DIR" "$DL_DIR" 2>/dev/null || true
+  ok "library:   $MEDIA_DIR/Movies  and  $MEDIA_DIR/TV Shows"
+  ok "downloads: $DL_DIR"
+  ok "configs:   $STACK_DIR/<app>/config"
+  info "every container mounts the library at the SAME path (/media) and downloads at"
+  info "/downloads, so Radarr/Sonarr/qBittorrent agree and no path mapping is needed."
+
+  # ---- 3. compose file + .env ------------------------------------------------
+  hdr "3. Compose file"
+  cp "$STACK_SRC" "$STACK_DIR/docker-compose.yml"
+  ok "wrote $STACK_DIR/docker-compose.yml"
+  if [ -f "$STACK_DIR/.env" ]; then
+    ok ".env already exists -- keeping your ports, timezone and paths"
+  else
+    local tz; tz="$(cat /etc/timezone 2>/dev/null || echo Etc/UTC)"
+    cat > "$STACK_DIR/.env" <<EOF
+PUID=$(id -u "$RUN_USER")
+PGID=$(id -g "$RUN_USER")
+TZ=$tz
+MEDIA_DIR=$MEDIA_DIR
+DOWNLOADS_DIR=$DL_DIR
+STACK_DIR=$STACK_DIR
+SEERR_PORT=${SEERR_PORT:-5055}
+RADARR_PORT=${RADARR_PORT:-7878}
+SONARR_PORT=${SONARR_PORT:-8989}
+PROWLARR_PORT=${PROWLARR_PORT:-9696}
+QBT_PORT=${QBT_PORT:-8080}
+QBT_TORRENT_PORT=${QBT_TORRENT_PORT:-6881}
+EOF
+    chown "$RUN_USER":"$RUN_USER" "$STACK_DIR/.env" 2>/dev/null || true
+    ok "wrote $STACK_DIR/.env  (uid=$(id -u "$RUN_USER") gid=$(id -g "$RUN_USER") tz=$tz)"
+  fi
+
+  # ---- 4. up -----------------------------------------------------------------
+  hdr "4. Starting containers"
+  if (cd "$STACK_DIR" && $COMPOSE up -d); then
+    ok "containers up"
+  else
+    die "docker compose up failed -- cd $STACK_DIR && $COMPOSE up -d   to see why"
+  fi
+  sleep 4
+  (cd "$STACK_DIR" && $COMPOSE ps) 2>/dev/null || true
+
+  # ---- 5. point the bridge at Seerr ------------------------------------------
+  hdr "5. Bridge wiring"
+  local BRIDGE_ENV="$CONFIG_DIR/bridge.env"
+  if [ -f "$BRIDGE_ENV" ]; then
+    if grep -q '^SEERR_URL=' "$BRIDGE_ENV" 2>/dev/null; then
+      ok "bridge.env already has SEERR_URL"
+    else
+      {
+        echo ""
+        echo "# --- Seerr: request titles so Radarr/Sonarr download them (no debrid) ---"
+        echo "SEERR_URL=http://127.0.0.1:${SEERR_PORT:-5055}"
+        echo "SEERR_MODE=${SEERR_MODE:-off}"
+        echo "# Get the key from Seerr -> Settings -> General AFTER the first-run wizard."
+        echo "# It is an ADMIN credential: keep this file chmod 600."
+        echo "SEERR_API_KEY="
+      } >> "$BRIDGE_ENV"
+      chmod 600 "$BRIDGE_ENV" 2>/dev/null || true
+      ok "added SEERR_URL + SEERR_API_KEY to $BRIDGE_ENV"
+      warn "SEERR_API_KEY is still empty -- fill it in after step 2 below, then:"
+      info "sudo systemctl restart mwatcher-bridge"
+    fi
+    if grep -q '^SEERR_API_KEY=..*' "$BRIDGE_ENV" 2>/dev/null; then
+      ok "SEERR_API_KEY is set"
+    fi
+  else
+    warn "$BRIDGE_ENV does not exist yet -- run: sudo bash install.sh"
+    info "then add SEERR_URL=http://127.0.0.1:${SEERR_PORT:-5055} and SEERR_API_KEY=<key>"
+  fi
+
+  # ---- 6. what to do next ----------------------------------------------------
+  local lan; lan="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)"
+  lan="${lan:-<this-server-ip>}"
+  hdr "Next: configure in this order (it matters)"
+  cat <<EOF
+  1. qBittorrent  http://$lan:${QBT_PORT:-8080}
+       Set a real password immediately (default admin/adminadmin).
+  2. Prowlarr     http://$lan:${PROWLARR_PORT:-9696}
+       Add your indexers, then Settings -> Apps -> add Radarr and Sonarr
+       (host: radarr / sonarr -- the compose service names).
+  3. Radarr       http://$lan:${RADARR_PORT:-7878}
+       Settings -> Download Clients -> add qBittorrent (host: qbittorrent, port ${QBT_PORT:-8080}).
+       Settings -> Media Management -> Add Root Folder -> /media/Movies
+  4. Sonarr       http://$lan:${SONARR_PORT:-8989}
+       Same download client; root folder /media/TV Shows
+  5. Seerr        http://$lan:${SEERR_PORT:-5055}
+       First-run wizard -> media server: Plex at http://host.docker.internal:32400
+       -> add the Radarr and Sonarr servers -> Settings -> General -> copy the API key
+       -> paste it into SEERR_API_KEY in $BRIDGE_ENV
+       -> sudo systemctl restart mwatcher-bridge
+
+  Then either browse Seerr's own UI and hit Request, or from the Mwatcher dashboard:
+       curl -X POST http://127.0.0.1:$BRIDGE_PORT/request -H 'Content-Type: application/json' \\
+            -d '{"title":"Dune","year":2021}'
+  And to watch something now WHILE the permanent copy downloads:
+       curl -X POST http://127.0.0.1:$BRIDGE_PORT/fetch -H 'Content-Type: application/json' \\
+            -d '{"title":"Dune","year":2021,"action":"both"}'
+
+  Useful:  cd $STACK_DIR && $COMPOSE ps        (or: logs -f seerr)
+           sudo bash install.sh status         (shows Seerr reachability)
+EOF
+  echo
+}
+
 usage() {
   cat <<EOF
 Mwatcher installer
@@ -603,6 +828,8 @@ Mwatcher installer
   sudo bash install.sh                    install / repair, then show status
   sudo bash install.sh status             report only, change nothing
   sudo bash install.sh doctor [title]     diagnose playback problems (s1001 etc.)
+  sudo bash install.sh seerr              Seerr + Radarr/Sonarr + Prowlarr + qBittorrent
+                                          (request a title, your server downloads it)
   sudo bash install.sh uninstall          remove the services (keeps media)
 
 Safe to re-run: existing keys, passwords and addon lists are preserved.
@@ -613,6 +840,7 @@ case "${1:-install}" in
   install|"")  do_install ;;
   status)      do_status ;;
   doctor)      shift; do_doctor "${1:-}" ;;
+  seerr)       do_seerr ;;
   uninstall)   do_uninstall ;;
   -h|--help|help) usage ;;
   *)           usage; exit 1 ;;

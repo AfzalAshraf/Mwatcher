@@ -35,6 +35,21 @@ Three ways to drive it
      GET /jobs                 progress + which stream was picked and why
      GET /config               effective configuration
      GET /healthz              ok
+     GET /seerr                is Seerr reachable + what is queued for download
+     POST /request             ask Seerr to fetch a title (Radarr/Sonarr download it)
+
+SEERR -- request it instead of streaming it (no debrid service needed):
+
+     POST /request  -d '{"title":"Dune","year":2021}'
+     POST /fetch    -d '{"title":"Dune","action":"both"}'    # request AND stream now
+
+  Seerr does not download anything itself: it hands the request to Radarr/Sonarr, which
+  use Prowlarr (indexers) and a download client (qBittorrent/SABnzbd) to put real files
+  in your library. So the chain is  Seerr -> Radarr/Sonarr -> qBittorrent -> ~/media ->
+  Plex. What that buys you over streaming from an addon: no debrid subscription, the
+  file is yours forever, proper quality profiles and subtitles, and no link rot.
+  Set SEERR_URL + SEERR_API_KEY (Seerr -> Settings -> General; treat it as an admin
+  credential) and SEERR_MODE=off|request|both.
 
 Configuration is by environment variable so the systemd unit stays the single source of
 truth (see services/mwatcher-bridge.service and config/bridge.env.example):
@@ -56,6 +71,11 @@ truth (see services/mwatcher-bridge.service and config/bridge.env.example):
                               direct media link ({url}/{title} substituted). Default off --
                               Fast Combo is the source now.
   BRIDGE_HOST / BRIDGE_PORT   Endpoint bind address              (default 127.0.0.1:8889)
+  SEERR_URL                   Seerr base url                     (default off)
+  SEERR_API_KEY               Seerr -> Settings -> General       (admin credential!)
+  SEERR_MODE                  off | request | both               (default off)
+  SEERR_IS4K                  request the 4K variant             (default 0)
+  SEERR_TV_SEASONS            all | missing | "1,2"              (default all)
 
 Keep the endpoint and Fast Combo on 127.0.0.1 -- expose them with a reverse proxy (and
 auth) only if you must. Torrent links (infoHash, no url) cannot be downloaded directly;
@@ -89,6 +109,10 @@ try:
     import stremio_source
 except ImportError:  # pragma: no cover - bridge still works for direct URLs without it
     stremio_source = None
+try:
+    import seerr_source
+except ImportError:  # pragma: no cover - Seerr support is optional
+    seerr_source = None
 
 # --------------------------------------------------------------------------- config
 
@@ -104,6 +128,30 @@ FASTCOMBO_PREFER = os.environ.get("FASTCOMBO_PREFER", "best")
 FASTCOMBO_MAX_FALLBACKS = int(os.environ.get("FASTCOMBO_MAX_FALLBACKS", "4"))
 FASTCOMBO_TIMEOUT = float(os.environ.get("FASTCOMBO_TIMEOUT", "60"))
 CINEMETA_URL = os.environ.get("CINEMETA_URL", stremio_source.DEFAULT_CINEMETA if stremio_source else "")
+
+# --- Seerr: request it, and your own server downloads it (no debrid) -------------------
+# Seerr is the request/approval layer; it delegates to Radarr/Sonarr, which use Prowlarr
+# (indexers) and a download client (qBittorrent/SABnzbd) to put real files in ~/media.
+# That is the "browse -> request -> it lands on my server" path, and it needs no debrid
+# subscription -- torrents/NZBs do the fetching.
+#
+# SEERR_MODE:
+#   off     never touch Seerr (default; stream via Fast Combo as before)
+#   request only create a Seerr request -- nothing is downloaded by the bridge
+#   both    create the Seerr request AND stream now, so you can watch immediately
+#           while the permanent copy is fetched in the background
+SEERR_URL = os.environ.get("SEERR_URL", "").rstrip("/")
+SEERR_API_KEY = os.environ.get("SEERR_API_KEY", "")
+SEERR_MODE = os.environ.get("SEERR_MODE", "off").strip().lower()
+if SEERR_MODE not in ("off", "request", "both"):
+    SEERR_MODE = "off"
+SEERR_IS4K = os.environ.get("SEERR_IS4K", "0").lower() in ("1", "true", "yes")
+SEERR_TV_SEASONS = os.environ.get("SEERR_TV_SEASONS", "all")   # all | missing | "1,2"
+
+
+def seerr_ready() -> bool:
+    """Can we actually talk to Seerr? (module present + URL + API key)"""
+    return bool(seerr_source is not None and SEERR_URL and SEERR_API_KEY)
 
 RESOLVER_URL = os.environ.get("TELESTREAM_RESOLVER_URL", "")
 STAGING = os.environ.get("TELESTREAM_STAGING", os.path.join(HOME, "media", "staging"))
@@ -123,7 +171,10 @@ MAX_JOBS = int(os.environ.get("TELESTREAM_MAX_JOBS", "200"))
 
 
 def log(msg: str) -> None:
-    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
+    # stderr, not stdout: the CLI prints a job as JSON on stdout, so logging there
+    # would corrupt it for anything piping the output (jq, cron, scripts). journald
+    # captures both, so the systemd service is unaffected.
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}", file=sys.stderr, flush=True)
 
 
 def default_download_cmd(stream_url: str = "") -> str:
@@ -582,9 +633,95 @@ def run_job(job_id: str, payload: dict) -> None:
         update_job(job_id, status="failed", error=str(exc))
 
 
-def enqueue(payload: dict) -> str:
+def run_seerr_job(job_id: str, payload: dict, terminal: bool = True) -> dict | None:
+    """
+    Ask Seerr to get this title -- Radarr/Sonarr then download it to your server, so no
+    debrid service and no bridge-side download is involved.
+
+    terminal=True  -> this is the whole job; set the final status.
+    terminal=False -> "both" mode: record the outcome on the job and let the stream
+                      download continue even if Seerr is down or unhappy.
+    """
+    try:
+        if seerr_source is None:
+            raise RuntimeError("seerr_source.py is not importable (is scripts/ next to the bridge?)")
+        if not seerr_ready():
+            raise RuntimeError(
+                "Seerr is not configured. Set SEERR_URL and SEERR_API_KEY in "
+                "~/.config/mwatcher/bridge.env -- the key is in Seerr -> Settings -> General.")
+        title = (payload.get("title") or "").strip()
+        imdb = (payload.get("imdb") or "").strip()
+        if not (title or imdb):
+            raise RuntimeError("need 'title' or 'imdb' to request a title in Seerr")
+        kind = (payload.get("kind") or "").strip().lower() or None
+        if kind == "series":
+            kind = "tv"
+        # Seerr wants season numbers for TV; accept the bridge's "season" or an explicit list.
+        seasons = payload.get("seasons")
+        if not seasons and payload.get("season"):
+            try:
+                seasons = [int(payload["season"])]
+            except (TypeError, ValueError):
+                seasons = None
+        is4k = payload.get("is4k")
+        if is4k is None:
+            is4k = SEERR_IS4K or None
+        update_job(job_id, status="searching", action="seerr")
+        log(f"job {job_id}: asking Seerr for '{title or imdb}'")
+        result = seerr_source.request_title(
+            title=title, year=payload.get("year"), imdb=imdb, kind=kind,
+            seasons=seasons, is4k=is4k, base_url=SEERR_URL, api_key=SEERR_API_KEY)
+        log(f"job {job_id}: seerr -> {result.get('title')} "
+            f"tmdb={result.get('tmdb_id')} {result.get('status_label')}")
+        if terminal:
+            update_job(job_id, action="seerr", seerr=result, status="done",
+                       skipped=bool(result.get("already_available")),
+                       file=None)
+        else:
+            update_job(job_id, seerr=result)
+        return result
+    except Exception as exc:  # noqa: BLE001 - surface it on the job/dashboard
+        log(f"job {job_id}: seerr FAILED - {exc}")
+        if terminal:
+            update_job(job_id, action="seerr", status="failed", error=str(exc))
+        else:
+            update_job(job_id, seerr_error=str(exc))
+        return None
+
+
+def dispatch_job(job_id: str, payload: dict, action: str) -> None:
+    """Route a job to Seerr, to the stream downloader, or to both."""
+    if action == "seerr":
+        run_seerr_job(job_id, payload)
+        return
+    if action == "both":
+        # Request first: it is the cheap call, and it is the one that gets you a permanent
+        # copy. If Seerr is unavailable we say so on the job but still stream now.
+        run_seerr_job(job_id, payload, terminal=False)
+        update_job(job_id, action="both", status="queued")
+        run_job(job_id, payload)
+        return
+    run_job(job_id, payload)
+
+
+def resolve_action(payload: dict, action: str = "") -> str:
+    """Per-request 'action' wins; otherwise fall back to SEERR_MODE."""
+    act = (action or payload.get("action") or "").strip().lower()
+    if act in ("stream", "seerr", "both"):
+        return act
+    if SEERR_MODE == "request":
+        return "seerr"
+    if SEERR_MODE == "both":
+        return "both"
+    return "stream"
+
+
+def enqueue(payload: dict, action: str = "") -> str:
     job_id = new_job(payload)
-    threading.Thread(target=run_job, args=(job_id, payload), daemon=True).start()
+    act = resolve_action(payload, action)
+    payload = {**payload, "action": act}
+    update_job(job_id, action=act)
+    threading.Thread(target=dispatch_job, args=(job_id, payload, act), daemon=True).start()
     return job_id
 
 
@@ -602,6 +739,9 @@ def dashboard_html() -> str:
         "TV library": TV_DIR,
         "Downloader": _tool_of(DOWNLOAD_CMD or default_download_cmd()),
         "Legacy resolver": RESOLVER_URL or "(off — Fast Combo is the source)",
+        "Seerr": (f"{SEERR_URL} · key set · mode={SEERR_MODE}" if seerr_ready() else
+                  ("not configured — set SEERR_URL + SEERR_API_KEY in bridge.env"
+                   if seerr_source is not None else "unavailable (seerr_source.py missing)")),
     }
     cfg = "".join(
         f'<div class="cfg"><span>{e(k)}</span><code>{e(str(v))}</code></div>'
@@ -610,7 +750,9 @@ def dashboard_html() -> str:
     warn = "" if fc_ready else (
         '<p class="warn">Fast Combo is not configured yet. Set <code>FASTCOMBO_BASE_URL</code> and '
         '<code>FASTCOMBO_ACCESS_KEY</code>, or use the direct-URL form below.</p>')
-    return _PAGE.replace("{{CONFIG}}", cfg).replace("{{WARN}}", warn)
+    return (_PAGE.replace("{{CONFIG}}", cfg).replace("{{WARN}}", warn)
+            .replace("{{SEERR}}", "true" if seerr_ready() else "false")
+            .replace("{{SEERRURL}}", SEERR_URL or ""))
 
 
 _PAGE = """<!doctype html>
@@ -718,6 +860,8 @@ _PAGE = """<!doctype html>
       <label style="margin:0">Season <input id="season" type="number" value="1" min="1" style="width:70px"></label>
       <label style="margin:0">Episode <input id="episode" type="number" value="1" min="1" style="width:70px"></label>
       <button class="ghost sm" id="reload" type="button">Re-query</button>
+      <button class="ghost sm" id="reqseerr" type="button"
+              title="Ask Seerr to have Radarr/Sonarr download this to your server (no debrid)">Request in Seerr</button>
       <button class="sm" id="fetchbest" type="button" style="margin-left:auto">Fetch best into Plex</button>
     </div>
     <table><thead><tr><th>Pick</th><th>Quality</th><th>Size</th><th>Speed</th><th>From</th><th></th></tr></thead>
@@ -757,6 +901,8 @@ _PAGE = """<!doctype html>
 <script>
 const $ = id => document.getElementById(id);
 let chosen = null;   // the title picked from search results
+const SEERR_ON = {{SEERR}};          // is Seerr configured? (injected by the bridge)
+const SEERR_URL = "{{SEERRURL}}";
 
 function esc(s){ return (s==null?'':String(s)).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 function ago(t){ const s=Math.max(0,(Date.now()/1000-t)|0); return s<60? s+'s ago' : (s/60|0)+'m ago'; }
@@ -778,10 +924,17 @@ $('search').addEventListener('submit', async ev=>{
       +'<span class="pill">'+esc(m.year||'?')+'</span>'
       +'<span class="pill">'+esc(m.type)+'</span>'
       +'<div class="m">'+esc(m.id)+'</div></div>'
-      +'<button class="ghost sm" data-id="'+esc(m.id)+'" data-type="'+esc(m.type)+'" data-name="'
-      +esc(m.name)+'" data-year="'+esc((m.year||'').slice(0,4))+'">Show streams</button></div>'
+      +'<span style="display:flex;gap:6px;flex-wrap:wrap">'
+      +'<button class="ghost sm" data-act="streams" data-id="'+esc(m.id)+'" data-type="'+esc(m.type)+'" data-name="'
+      +esc(m.name)+'" data-year="'+esc((m.year||'').slice(0,4))+'">Show streams</button>'
+      +(SEERR_ON ? '<button class="ghost sm" data-act="request" data-id="'+esc(m.id)+'" data-type="'+esc(m.type)+'" data-name="'
+      +esc(m.name)+'" data-year="'+esc((m.year||'').slice(0,4))+'" title="Download to my server via Seerr">Request</button>' : '')
+      +'</span></div>'
     ).join('');
-    $('results').querySelectorAll('button').forEach(b=>b.addEventListener('click',()=>select(b.dataset)));
+    $('results').querySelectorAll('button').forEach(b=>b.addEventListener('click',()=>{
+      if(b.dataset.act==='request') return requestSeerr(b.dataset);
+      select(b.dataset);
+    }));
   }catch(e){ $('results').innerHTML='<div class="empty">Search failed: '+esc(e.message)+'</div>'; }
 });
 
@@ -830,6 +983,12 @@ $('reload').addEventListener('click', loadStreams);
 $('season').addEventListener('change', loadStreams);
 $('episode').addEventListener('change', loadStreams);
 $('fetchbest').addEventListener('click', ()=>fetchNow({}));
+if(SEERR_ON){
+  $('reqseerr').addEventListener('click', ()=>requestSeerr(chosen
+    ? {id:chosen.id, type:chosen.type, name:chosen.name, year:chosen.year} : {}));
+}else{
+  $('reqseerr').classList.add('hidden');
+}
 
 // ---- 3. fetch --------------------------------------------------------------------
 async function fetchNow(extra){
@@ -860,6 +1019,28 @@ $('direct').addEventListener('submit', ev=>{
   setTimeout(refreshJobs, 400);
 });
 
+// ---- 3b. request in Seerr (download to my server, no debrid) ----------------------
+async function requestSeerr(d){
+  if(!SEERR_ON){ ping('Seerr is not configured - set SEERR_URL and SEERR_API_KEY'); return; }
+  const isShow = (d.type==='series'||d.type==='show');
+  const body = { title:d.name||'', year:d.year||'', imdb:d.id||'', kind:isShow?'tv':'movie' };
+  if(isShow && $('season')) body.season = parseInt($('season').value||1,10);
+  Object.keys(body).forEach(k=>{ if(body[k]===undefined||body[k]==='') delete body[k]; });
+  ping('Asking Seerr…');
+  try{
+    const r = await fetch('/request',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(body)});
+    const j = await r.json();
+    if(r.ok && j.seerr){
+      ping('Seerr: '+(j.seerr.title||body.title||'')+' → '+j.seerr.status_label
+           +(j.seerr.already_available?' (already in your library)':''));
+    }else{
+      ping('Seerr: '+String(j.error||r.status).slice(0,140));
+    }
+    setTimeout(refreshJobs, 400);
+  }catch(e){ ping('Seerr request failed: '+e.message); }
+}
+
 // ---- 4. jobs ---------------------------------------------------------------------
 async function refreshJobs(){
   try{
@@ -869,16 +1050,24 @@ async function refreshJobs(){
     $('rows').innerHTML = d.jobs.map(j=>{
       const p=j.payload||{}, s=j.source||{};
       const t = (p.title||j.imdb||'?')+(p.year?' ('+p.year+')':'')+(p.episode?' '+p.episode:'');
+      const isSeerr = j.action==='seerr';
       const src = s.mode==='fastcombo'
         ? [s.resolution, gb(s.size_bytes), s.start_seconds!=null?s.start_seconds.toFixed(1)+'s':'',
            s.source, s.addon].filter(Boolean).join(' · ')
-        : (s.mode||'—');
-      const res = j.status==='done' ? '<code>'+esc(j.file||'')+'</code>'
-                + (j.skipped?' <span class="pill">already had it</span>':'')
+        : isSeerr ? 'Seerr → Radarr/Sonarr' : (s.mode||'—');
+      const seerrTxt = j.seerr
+        ? '<div class="m">seerr: '+esc(j.seerr.title||'')+(j.seerr.tmdb_id?' tmdb '+esc(j.seerr.tmdb_id):'')
+          +' · '+esc(j.seerr.status_label||'')+(j.seerr.message?' · '+esc(j.seerr.message):'')+'</div>'
+        : j.seerr_error ? '<div class="m">seerr failed: '+esc(String(j.seerr_error).slice(0,140))+'</div>' : '';
+      const res = j.status==='done'
+                ? (isSeerr ? '<span class="pill">requested in Seerr</span>'
+                           : '<code>'+esc(j.file||'')+'</code>')
+                + (j.skipped?' <span class="pill">'+(isSeerr?'already in library':'already had it')+'</span>':'')
                 + (j.attempt>1?' <span class="pill">used fallback #'+j.attempt+'</span>':'')
                 + (j.media&&j.media.verified?' <span class="pill">verified video</span>':'')
                 + (j.tried||[]).map(t=>'<div class="m">rejected #'+(t.rank!=null?t.rank:'?')
                      +': '+esc(String(t.error||'').slice(0,140))+'</div>').join('')
+                + seerrTxt
                 : j.status==='failed' ? esc(j.error||'')
                 + (j.tried||[]).map(t=>'<div class="m">rejected #'+(t.rank!=null?t.rank:'?')
                      +': '+esc(String(t.error||'').slice(0,140))+'</div>').join('')
@@ -925,7 +1114,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send_html(200, dashboard_html())
         elif path == "/healthz":
             self._send(200, {"ok": True, "fastcombo": bool(FASTCOMBO_ACCESS_KEY),
-                            "stremio_source": stremio_source is not None})
+                            "stremio_source": stremio_source is not None,
+                            "seerr": seerr_ready(), "seerr_mode": SEERR_MODE})
         elif path == "/jobs":
             with JOBS_LOCK:
                 jobs = sorted(JOBS.values(), key=lambda j: j["created"], reverse=True)
@@ -940,7 +1130,28 @@ class Handler(BaseHTTPRequestHandler):
                 "movies_dir": MOVIES_DIR, "tv_dir": TV_DIR,
                 "downloader": _tool_of(DOWNLOAD_CMD or default_download_cmd()),
                 "resolver_url": RESOLVER_URL,
+                "seerr_url": SEERR_URL, "seerr_ready": seerr_ready(),
+                "seerr_mode": SEERR_MODE, "seerr_is4k": SEERR_IS4K,
             })
+        elif path == "/seerr":
+            # Is Seerr reachable, and what is queued for download right now?
+            if not seerr_ready():
+                self._send(200, {
+                    "ok": False, "configured": False,
+                    "error": "SEERR_URL / SEERR_API_KEY not set",
+                    "hint": "key is in Seerr -> Settings -> General; put both in "
+                            "~/.config/mwatcher/bridge.env (chmod 600)",
+                })
+                return
+            try:
+                info = seerr_source.server_status(base_url=SEERR_URL, api_key=SEERR_API_KEY)
+                recent = seerr_source.pending_requests(20, base_url=SEERR_URL, api_key=SEERR_API_KEY)
+                self._send(200, {"ok": True, "configured": True, "url": SEERR_URL,
+                                 "version": info.get("version"), "mode": SEERR_MODE,
+                                 "requests": recent})
+            except Exception as exc:  # noqa: BLE001
+                self._send(502, {"ok": False, "configured": True, "url": SEERR_URL,
+                                 "error": str(exc)})
         elif path == "/search":
             # Title text -> IMDb matches (Cinemeta), so the dashboard can offer a picker.
             q = (qs.get("q") or "").strip()
@@ -986,12 +1197,13 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception as exc:  # noqa: BLE001
                     self._send(502, {"ok": False, "error": str(exc)})
         else:
-            self._send(404, {"error": "try GET /jobs, /search?q=, /streams?id=tt... or POST /fetch"})
+            self._send(404, {"error": "try GET /jobs, /seerr, /search?q=, /streams?id=tt... "
+                                     "or POST /fetch (stream now) / POST /request (ask Seerr)"})
 
     def do_POST(self) -> None:  # noqa: N802
         path = urllib.parse.urlparse(self.path).path
-        if path != "/fetch":
-            self._send(404, {"error": "POST /fetch"})
+        if path not in ("/fetch", "/request"):
+            self._send(404, {"error": "POST /fetch (stream now) or POST /request (ask Seerr)"})
             return
         try:
             length = int(self.headers.get("Content-Length") or 0)
@@ -1002,8 +1214,41 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, {"error": f"bad JSON: {exc}"})
             return
 
+        if path == "/request":
+            # Seerr path: resolve the title, create the request, answer synchronously.
+            # It is two short HTTP calls, so callers get a real yes/no instead of a job id.
+            job_id = new_job(payload)
+            result = run_seerr_job(job_id, payload)
+            with JOBS_LOCK:
+                job = dict(JOBS.get(job_id) or {})
+            if job.get("status") == "done":
+                self._send(200, {
+                    "ok": True, "job": job_id, "action": "seerr", "seerr": result,
+                    "note": ("Seerr handed this to Radarr/Sonarr; watch the request in "
+                             f"{SEERR_URL}/requests" if result and not result.get("already_available")
+                             else (result or {}).get("message", "")),
+                })
+            else:
+                err = str(job.get("error") or "")
+                # Only point at configuration when the failure actually looks like it.
+                looks_like_config = any(k in err.lower() for k in (
+                    "not configured", "api key", "http 401", "http 403", "cannot reach seerr",
+                    "permission"))
+                self._send(502, {"ok": False, "job": job_id, "error": err,
+                                 "hint": ("check SEERR_URL / SEERR_API_KEY, and that Seerr -> "
+                                          "Settings -> Servers has Radarr/Sonarr attached"
+                                          if looks_like_config else
+                                          "pass a title (and year/kind) that Seerr can match "
+                                          "to a TMDB entry")})
+            return
+
         job_id = enqueue(payload)
-        self._send(202, {"job": job_id, "status": "queued", "poll": f"/jobs"})
+        act = resolve_action(payload)
+        self._send(202, {"job": job_id, "status": "queued", "action": act,
+                         "poll": "/jobs",
+                         "what": {"stream": "downloading the best stream from your addons",
+                                  "seerr": "creating a request in Seerr",
+                                  "both": "requesting in Seerr and streaming now"}.get(act, "")})
 
     def log_message(self, fmt: str, *args) -> None:  # keep journald tidy
         log(f"{self.address_string()} {fmt % args}")
@@ -1043,7 +1288,16 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--url", help="direct/Telestream stream URL instead of an addon lookup")
     parser.add_argument("--stream", help="same as --url but skip the local resolver")
     parser.add_argument("--dest", help="override destination folder (skips Plex naming rules)")
+    # Seerr: request a title so Radarr/Sonarr download it to your server
+    parser.add_argument("--action", choices=["stream", "seerr", "both"],
+                        help="stream (download the best addon stream), seerr (create a Seerr "
+                             "request only), or both. Default comes from SEERR_MODE.")
+    parser.add_argument("--seasons", help='for a Seerr TV request: "all", "missing", or "1,3"')
+    parser.add_argument("--4k", dest="is4k", action="store_true",
+                        help="request the 4K variant in Seerr (needs a 4K server configured there)")
     # inspect instead of fetching
+    parser.add_argument("--seerr-status", action="store_true",
+                        help="is Seerr reachable, and what is queued for download?")
     parser.add_argument("--search", action="store_true", help="just list IMDb matches for --title")
     parser.add_argument("--list-streams", action="store_true",
                         help="just list the ranked candidates Fast Combo returns, download nothing")
@@ -1052,8 +1306,27 @@ def main(argv: list[str]) -> int:
     if args.serve == "serve":
         serve()
         return 0
-    if stremio_source is None and not (args.url or args.stream):
+    want_action = (args.action or "").strip().lower() or (
+        "seerr" if SEERR_MODE == "request" else "both" if SEERR_MODE == "both" else "stream")
+    if stremio_source is None and not (args.url or args.stream) and want_action != "seerr":
         parser.error("stremio_source.py is missing, so only --url/--stream mode is available")
+
+    # --- inspect: Seerr --------------------------------------------------------------
+    if args.seerr_status:
+        if not seerr_ready():
+            print("Seerr is not configured. Set SEERR_URL and SEERR_API_KEY "
+                  "(Seerr -> Settings -> General).", file=sys.stderr)
+            return 2
+        try:
+            info = seerr_source.server_status(base_url=SEERR_URL, api_key=SEERR_API_KEY)
+            print(f"Seerr {info.get('version')} at {info.get('base_url')}  (mode={SEERR_MODE})")
+            for r in seerr_source.pending_requests(20, base_url=SEERR_URL, api_key=SEERR_API_KEY):
+                print(f"  [{r['status_label']:>20}] {r['media_type']:<5} tmdb={r['tmdb_id']} "
+                      f"request#{r['id']} by {r.get('requested_by') or '?'}")
+            return 0
+        except Exception as exc:  # noqa: BLE001
+            print(f"seerr error: {exc}", file=sys.stderr)
+            return 2
 
     # --- inspect: title search -------------------------------------------------------
     if args.search:
@@ -1082,6 +1355,9 @@ def main(argv: list[str]) -> int:
     if not direct and not (args.imdb or args.title):
         parser.error("need --imdb or --title (Fast Combo lookup), or --url/--stream (direct link), "
                      "or the 'serve' subcommand")
+    if want_action in ("seerr", "both") and not seerr_ready():
+        parser.error("--action " + want_action + " needs SEERR_URL and SEERR_API_KEY "
+                     "(the key is in Seerr -> Settings -> General)")
 
     payload = {
         "title": args.title or "",
@@ -1093,6 +1369,9 @@ def main(argv: list[str]) -> int:
         "episode": args.episode or "",
         "prefer": args.prefer or "",
         "dest": args.dest,
+        "action": want_action,
+        "seasons": args.seasons or "",
+        "is4k": True if args.is4k else None,
     }
     if args.stream:
         # --stream means the URL is already direct: bypass the resolver for this job only
@@ -1100,7 +1379,7 @@ def main(argv: list[str]) -> int:
         RESOLVER_URL = ""
 
     job_id = new_job(payload)
-    run_job(job_id, payload)  # foreground: the exit code is useful in scripts/cron
+    dispatch_job(job_id, payload, want_action)  # foreground: exit code is useful in cron
     with JOBS_LOCK:
         job = dict(JOBS[job_id])
     print(json.dumps(job, indent=2))

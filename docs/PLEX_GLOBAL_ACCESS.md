@@ -314,6 +314,103 @@ live link probing (the fake files answer `Range` requests, which is what it prob
   echo "https://files.example.com/Dune.2021.1080p.mkv" > "/home/afine/media/Movies/Dune (2021)/Dune (2021).strm"
   ```
 
+### 4.6 Seerr — request a title and your own server downloads it (no debrid)
+
+§4.1–4.5 pull a file down on demand. The other way to build a library is to **request** a
+title and let your server fetch it properly, once, and keep it. That is what
+[Seerr](https://github.com/fallenbagel/seerr) does — and it needs no debrid subscription,
+because torrents/NZBs do the fetching instead.
+
+```bash
+sudo bash install.sh seerr
+```
+
+One command: installs Docker, starts Seerr + Radarr + Sonarr + Prowlarr + qBittorrent with
+`services/seerr-stack/docker-compose.yml`, creates the folders, and adds `SEERR_URL` to your
+bridge config. Safe to re-run — an existing `.env` (ports, timezone, paths) is kept.
+
+**Be clear about what Seerr is.** It never downloads anything itself; it is the
+request/approval layer:
+
+```
+you  →  Seerr (5055)  →  Radarr (7878) movies  /  Sonarr (8989) TV
+                              │
+                              ├→ Prowlarr (9696)     find a release on your indexers
+                              ├→ qBittorrent (8080)  download it
+                              └→ import into ~/media/…  →  Plex sees the file
+```
+
+So Seerr replaces **debrid**, not Radarr/Sonarr. If you want the single-command path, that
+stack is exactly what `install.sh seerr` sets up.
+
+**Configure in this order** (the installer prints it again at the end):
+
+1. qBittorrent `:8080` — set a real password now (default `admin`/`adminadmin`)
+2. Prowlarr `:9696` — add your indexers; Settings → Apps → add Radarr and Sonarr
+3. Radarr `:7878` — Download Clients → qBittorrent (host `qbittorrent`, port `8080`);
+   Media Management → root folder `/media/Movies`
+4. Sonarr `:8989` — same client; root folder `/media/TV Shows`
+5. Seerr `:5055` — wizard → Plex at `host.docker.internal:32400` → add the Radarr and
+   Sonarr servers → copy the API key from Settings → General into `SEERR_API_KEY` in
+   `~/.config/mwatcher/bridge.env`, then `sudo systemctl restart mwatcher-bridge`
+
+> **Security.** Seerr's API key is an **admin credential** — anyone holding it can change
+> your server settings. It lives in the chmod 600 env file and is only ever used
+> server-side by the bridge; the dashboard never receives it.
+
+Every container mounts your library at the **same** path (`/media`) and downloads at
+`/downloads`, so Radarr, Sonarr and qBittorrent all agree where a file is. That is what
+prevents the classic "downloaded but import failed / path does not exist".
+
+#### Browsing and requesting
+
+Stremio's **Play** button cannot call Seerr — an addon may only return catalogs, metadata
+and streams, so there is no hook for "send this to Seerr". What you get instead covers the
+same ground:
+
+- **Seerr's own UI** (`http://<server>:5055`) — trending/popular/search catalogs with a
+  **Request** button on every title. The natural browse-and-request surface.
+- **The Mwatcher dashboard** (`http://<server>:8889`) — one search box, both actions:
+  *Show streams* → *Fetch best into Plex* (stream now), or *Request* (Seerr downloads it).
+- **One call**, if you drive it yourself:
+
+```bash
+# ask Seerr to get it — the bridge downloads nothing
+curl -X POST http://127.0.0.1:8889/request -H 'Content-Type: application/json' \
+     -d '{"title":"Dune","year":2021,"kind":"movie"}'
+
+# watch it NOW *and* request the permanent copy at the same time
+curl -X POST http://127.0.0.1:8889/fetch -H 'Content-Type: application/json' \
+     -d '{"title":"Dune","year":2021,"action":"both"}'
+
+# from the CLI
+python3 scripts/telestream_to_plex.py --title "Dune" --year 2021 --action seerr
+python3 scripts/telestream_to_plex.py --seerr-status
+```
+
+`action` is `stream` (default), `seerr` (request only) or `both`. Set `SEERR_MODE=both` in
+`bridge.env` to make that the default for every request, and `SEERR_MODE=request` to turn
+the bridge into a pure Seerr front-end that never downloads anything itself.
+
+`both` is the combination that replaces debrid for most people: the addon stream gets you
+watching in seconds while Radarr/Sonarr fetch a proper release that stays in your library
+forever and survives link rot.
+
+#### When a request never becomes a file
+
+`sudo bash install.sh doctor` checks this path too (section 6). Usual causes:
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Request stays *Pending* | auto-approve is off | Seerr → Settings → Users → Auto-Approve, or approve at `/requests` |
+| Approved, nothing downloads | no Radarr/Sonarr attached to Seerr | Seerr → Settings → Servers → add them |
+| "No releases found" | no indexer carries it | add indexers in Prowlarr — or accept it is not available |
+| Downloaded but not imported | path mismatch with qBittorrent | use the compose file here: everything sees `/media` and `/downloads` |
+| *Available* never updates | Seerr has no Plex server | Seerr → Settings → Media Server → Plex |
+| Bridge says `Seerr is not configured` | `SEERR_URL`/`SEERR_API_KEY` missing | add both to `bridge.env`, restart the bridge |
+
+---
+
 ## 5. Global access — pick ONE
 
 ### a) Plex native Remote Access (default, free, encrypted)
@@ -540,6 +637,16 @@ curl -s http://127.0.0.1:8889/config               # effective settings
 curl -s "http://127.0.0.1:8889/search?q=dune"      # title -> IMDb id
 curl -s "http://127.0.0.1:8889/streams?id=tt1160419&prefer=fastest"   # ranked candidates
 curl -s http://127.0.0.1:8889/jobs                 # queue + provenance
+curl -s http://127.0.0.1:8889/seerr                # Seerr reachable? what is queued?
+curl -s -X POST http://127.0.0.1:8889/request -H 'Content-Type: application/json' \
+  -d '{"title":"Dune","year":2021}'                # request it -> Radarr/Sonarr fetch it
+curl -s -X POST http://127.0.0.1:8889/fetch -H 'Content-Type: application/json' \
+  -d '{"title":"Dune","year":2021,"action":"both"}'  # watch now AND own it
+
+sudo bash install.sh seerr                         # bring the Seerr stack up
+sudo bash install.sh doctor                        # includes the Seerr request path (§6)
+cd ~/mwatcher-seerr && docker compose ps           # Seerr/Radarr/Sonarr/qBittorrent health
+cd ~/mwatcher-seerr && docker compose logs -f seerr
 curl -s -H "x-admin-key: $FC_ADMIN_PASSWORD" \
   "http://127.0.0.1:7000/$FC_ACCESS_KEY/api/try/movie/tt1160419?fresh=1"   # why streams were dropped
 

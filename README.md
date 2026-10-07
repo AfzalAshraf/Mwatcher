@@ -23,12 +23,16 @@ your Stremio addons ──▶ Fast Combo ──▶ Mwatcher bridge ──▶ sta
 | Path | What it is |
 |---|---|
 | `docs/PLEX_GLOBAL_ACCESS.md` | **The full guide** — installing Plex on Lubuntu, running Fast Combo + the bridge, how the "best stream" is chosen, and reaching it all from anywhere (port forwarding, Cloudflare Tunnel, Tailscale/CGNAT) |
+| `install.sh` | **One command** to install/repair everything, plus `status`, `doctor` (diagnoses playback failures), `seerr` and `uninstall` |
 | `scripts/telestream_to_plex.py` | The bridge: dashboard + HTTP API + CLI. Resolve → download → name → library |
 | `scripts/stremio_source.py` | Fast Combo / Cinemeta client: parses and ranks addon streams, picks the best |
+| `scripts/seerr_source.py` | Seerr client: search → TMDB id → create a request, plus `--doctor` for the request path |
+| `services/seerr-stack/docker-compose.yml` | Seerr + Radarr + Sonarr + Prowlarr + qBittorrent, all sharing one media path |
 | `services/fastcombo.service` | Runs your addons (Fast Combo) on `127.0.0.1:7000` |
 | `services/mwatcher-bridge.service` | Runs the bridge on `127.0.0.1:8889` |
 | `config/*.env.example` | Secret files for the two services (access key, admin password) |
 | `demo/fake_stremio_addon.py` | A pretend addon **and** pretend Cinemeta, so you can test the whole pipeline offline |
+| `demo/fake_seerr.py` | A pretend Seerr (same API, same auth errors), so the request path is testable with no Docker |
 
 ## Quick start — one command
 
@@ -46,6 +50,7 @@ and never overwrites an existing key, password or addon list.
 sudo bash install.sh status                  # what's installed and running? changes nothing
 sudo bash install.sh doctor                  # why won't things play?
 sudo bash install.sh doctor "The Uprising"   # diagnose one title end to end
+sudo bash install.sh seerr                   # Seerr + Radarr/Sonarr + Prowlarr + qBittorrent
 sudo bash install.sh uninstall               # remove services, keep your media
 ```
 
@@ -108,18 +113,33 @@ chosen link dies mid-download, the bridge automatically tries the next-best one,
 
 ```bash
 python3 demo/fake_stremio_addon.py &            # pretend addon + pretend Cinemeta, :9912
+python3 demo/fake_seerr.py &                    # pretend Seerr, :5055
 
 FC_ACCESS_KEY=testkey123456 FC_ADMIN_PASSWORD=testpass1234 PORT=7000 \
   FC_UPSTREAMS=http://127.0.0.1:9912/manifest.json node ~/stremio-addons/server.js &
 
 CINEMETA_URL=http://127.0.0.1:9912 FASTCOMBO_BASE_URL=http://127.0.0.1:7000 \
   FASTCOMBO_ACCESS_KEY=testkey123456 FASTCOMBO_PREFER=fastest \
+  SEERR_URL=http://127.0.0.1:5055 SEERR_API_KEY=testkey \
   python3 scripts/telestream_to_plex.py serve   # dashboard on :8889
 ```
 
 The fake addon serves 7 streams per title including a CAM copy, a 720p, a duplicate on a
 slower host and a torrent — so you can watch Fast Combo filter them and the bridge rank
 what is left, with real link probing (the fake files answer `Range` requests).
+
+Two traps worth running:
+
+```bash
+# a host that looks like video to Fast Combo's probe but serves an HTML wall on the real
+# download -- the silent success that produces Plex error s1001. The bridge rejects it and
+# fails over to the next-best stream.
+DEMO_TRAP=4k python3 demo/fake_stremio_addon.py
+
+# a fresh Seerr with nothing attached, so you can see doctor say exactly what is missing
+SEERR_NO_SERVERS=1 SEERR_NO_PLEX=1 python3 demo/fake_seerr.py
+python3 scripts/seerr_source.py --doctor --url http://127.0.0.1:5055 --api-key testkey
+```
 
 ## Requirements
 
@@ -128,9 +148,40 @@ what is left, with real link probing (the fake files answer `Range` requests).
 - Plex Media Server, plus **Plex Pass** for remote playback in mobile/TV apps
   (remote playback in a web browser works without it)
 
+## Two ways to get a title
+
+| | **Stream it now** (Fast Combo) | **Request it** (Seerr) |
+|---|---|---|
+| What happens | your addons are queried, the single best link is downloaded into the library | Seerr → Radarr/Sonarr → Prowlarr → qBittorrent put a proper release in the library |
+| Needs | Fast Combo + your addons | Docker + the Seerr stack + indexers |
+| Debrid needed | only for torrent-only links (the bridge skips those) | **no** — torrents/NZBs do the fetching |
+| Speed to watching | seconds to minutes | as long as the download takes |
+| Survives link rot | no — re-fetch if a host dies | yes, the file is yours |
+
+`action` picks per request: `stream`, `seerr`, or `both` — and `both` is the useful one:
+you start watching from an addon stream immediately while the permanent copy downloads.
+
+```bash
+sudo bash install.sh seerr                        # one command for the whole stack
+
+curl -X POST localhost:8889/request -H 'Content-Type: application/json' \
+     -d '{"title":"Dune","year":2021}'            # request it
+curl -X POST localhost:8889/fetch -H 'Content-Type: application/json' \
+     -d '{"title":"Dune","year":2021,"action":"both"}'   # watch now AND own it
+curl -s localhost:8889/seerr                      # reachable? what's queued?
+```
+
+Note that Seerr itself never downloads — it delegates to Radarr/Sonarr, which is why the
+installer brings up that stack too. Details, configuration order and "my request never
+became a file" in `docs/PLEX_GLOBAL_ACCESS.md` §4.6.
+
 ## Trade-off, plainly
 
 This **downloads** media rather than streaming it on demand: budget disk space and fetch
 time (a 4K movie is 15-25 GB). In exchange you get the best available copy, correctly
 named, playable on every Plex client, with Plex's own transcoding, subtitles, resume
 positions and sharing. See `docs/PLEX_GLOBAL_ACCESS.md` §4.5.
+
+If you would rather not have the bridge download at all, use Seerr (§4.6): request a title
+and Radarr/Sonarr fetch it via your own indexers — no debrid subscription, and the release
+is chosen by quality profile rather than by whatever an addon happens to have.
