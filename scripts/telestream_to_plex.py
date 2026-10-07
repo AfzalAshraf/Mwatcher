@@ -1,0 +1,1111 @@
+#!/usr/bin/env python3
+"""
+telestream_to_plex.py -- bridge your Stremio addons (via Fast Combo) into a Plex library.
+
+Plex has no addon/plugin system any more, so it cannot play a remote HTTP stream the way
+Stremio does. This script is the glue between the two: it asks Fast Combo
+(https://github.com/AfzalAshraf/stremio-addons) -- which queries all of your addons at
+once, filters out CAM copies, dead links, duplicates and files too big to stream
+smoothly, live-probes the rest and ranks them -- takes the SINGLE BEST downloadable
+link, fetches it into a staging folder, renames it the way Plex expects, and drops it
+into your library so every Plex client in the world can play it.
+
+If the chosen link dies part-way it automatically falls back to the next-best one.
+
+Three ways to drive it
+----------------------
+1) Web dashboard (search a title, see the ranked streams, press "Fetch best"):
+
+     python3 telestream_to_plex.py serve        # then open http://127.0.0.1:8889/
+
+2) One-shot CLI (good for cron / scripts):
+
+     python3 telestream_to_plex.py --title "Dune" --year 2021 --prefer fastest
+     python3 telestream_to_plex.py --imdb tt0903747 --kind show --episode S01E02
+     python3 telestream_to_plex.py --list-streams --imdb tt1160419   # rank, don't download
+     python3 telestream_to_plex.py --url https://host/file.mkv --title "Dune"  # direct link
+
+3) HTTP API (what an addon, shortcut or other service should call):
+
+     curl -X POST http://127.0.0.1:8889/fetch -H 'Content-Type: application/json' \
+       -d '{"title":"Dune","year":2021,"kind":"movie","prefer":"fastest"}'
+
+     GET /search?q=dune        title -> IMDb matches (Cinemeta)
+     GET /streams?id=tt1160419 ranked candidates from all your addons, best one flagged
+     GET /jobs                 progress + which stream was picked and why
+     GET /config               effective configuration
+     GET /healthz              ok
+
+Configuration is by environment variable so the systemd unit stays the single source of
+truth (see services/mwatcher-bridge.service and config/bridge.env.example):
+
+  FASTCOMBO_BASE_URL          Your Fast Combo server            (default http://127.0.0.1:7000)
+  FASTCOMBO_ACCESS_KEY        Secret part of your addon link    (required for addon lookups)
+  FASTCOMBO_TOKEN             Optional profile token from a personalised install link
+  FASTCOMBO_PREFER            best | fastest | smallest | 4kfirst | 1080first (default best)
+                              "fastest" = the link that starts soonest = "single best speed"
+  FASTCOMBO_MAX_FALLBACKS     How many next-best links to try if one fails   (default 4)
+  CINEMETA_URL                Title -> IMDb metadata (default https://v3-cinemeta.strem.io)
+  TELESTREAM_DOWNLOAD_CMD     Shell command that fetches a link. {stream} {out} {headers}
+                              are substituted ALREADY SHELL-QUOTED, so use them bare.
+                              Default: yt-dlp if present, else curl, else ffmpeg.
+  TELESTREAM_STAGING          Where partial downloads go          (default ~/media/staging)
+  TELESTREAM_MOVIES_DIR       Finished movies                    (default ~/media/Movies)
+  TELESTREAM_TV_DIR           Finished episodes                  (default ~/media/TV Shows)
+  TELESTREAM_RESOLVER_URL     Optional legacy hook: template that turns a --url into a
+                              direct media link ({url}/{title} substituted). Default off --
+                              Fast Combo is the source now.
+  BRIDGE_HOST / BRIDGE_PORT   Endpoint bind address              (default 127.0.0.1:8889)
+
+Keep the endpoint and Fast Combo on 127.0.0.1 -- expose them with a reverse proxy (and
+auth) only if you must. Torrent links (infoHash, no url) cannot be downloaded directly;
+they need a debrid service, so the bridge skips them and says so.
+
+Testing with no real addons: run demo/fake_stremio_addon.py (a pretend addon AND a
+pretend Cinemeta), point Fast Combo at it, and the whole pipeline runs offline.
+"""
+
+from __future__ import annotations
+
+import argparse
+import html
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+import urllib.request
+import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+# stremio_source.py lives next to this file; make sure it is importable however we are run.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    import stremio_source
+except ImportError:  # pragma: no cover - bridge still works for direct URLs without it
+    stremio_source = None
+
+# --------------------------------------------------------------------------- config
+
+HOME = os.path.expanduser("~")
+
+# --- Fast Combo / Stremio addons (https://github.com/AfzalAshraf/stremio-addons) -------
+# Fast Combo queries all of your addons at once and returns them ranked best-first, so
+# "the single best stream" is simply the first one that we can actually download.
+FASTCOMBO_BASE_URL = os.environ.get("FASTCOMBO_BASE_URL", "http://127.0.0.1:7000").rstrip("/")
+FASTCOMBO_ACCESS_KEY = os.environ.get("FASTCOMBO_ACCESS_KEY", "")
+FASTCOMBO_TOKEN = os.environ.get("FASTCOMBO_TOKEN", "")
+FASTCOMBO_PREFER = os.environ.get("FASTCOMBO_PREFER", "best")
+FASTCOMBO_MAX_FALLBACKS = int(os.environ.get("FASTCOMBO_MAX_FALLBACKS", "4"))
+FASTCOMBO_TIMEOUT = float(os.environ.get("FASTCOMBO_TIMEOUT", "60"))
+CINEMETA_URL = os.environ.get("CINEMETA_URL", stremio_source.DEFAULT_CINEMETA if stremio_source else "")
+
+RESOLVER_URL = os.environ.get("TELESTREAM_RESOLVER_URL", "")
+STAGING = os.environ.get("TELESTREAM_STAGING", os.path.join(HOME, "media", "staging"))
+MOVIES_DIR = os.environ.get("TELESTREAM_MOVIES_DIR", os.path.join(HOME, "media", "Movies"))
+TV_DIR = os.environ.get("TELESTREAM_TV_DIR", os.path.join(HOME, "media", "TV Shows"))
+BRIDGE_HOST = os.environ.get("BRIDGE_HOST", "127.0.0.1")
+BRIDGE_PORT = int(os.environ.get("BRIDGE_PORT", "8889"))
+
+DEFAULT_EXT = os.environ.get("TELESTREAM_EXT", ".mkv")
+RESOLVE_TIMEOUT = int(os.environ.get("TELESTREAM_RESOLVE_TIMEOUT", "30"))
+DOWNLOAD_TIMEOUT = int(os.environ.get("TELESTREAM_DOWNLOAD_TIMEOUT", "7200"))
+DOWNLOAD_CMD = os.environ.get("TELESTREAM_DOWNLOAD_CMD", "")
+
+JOBS: dict[str, dict] = {}
+JOBS_LOCK = threading.Lock()
+MAX_JOBS = int(os.environ.get("TELESTREAM_MAX_JOBS", "200"))
+
+
+def log(msg: str) -> None:
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
+
+
+def default_download_cmd(stream_url: str = "") -> str:
+    """
+    Pick a downloader we actually have. Placeholders {stream}/{out}/{headers} are
+    substituted with shell-quoted values, so use them BARE (no extra quotes).
+
+      yt-dlp  -- best: handles HLS/DASH, fragments and --add-header
+      curl    -- plain progressive files from a file host
+      ffmpeg  -- HLS/DASH remux when yt-dlp is missing (cannot send custom headers)
+    """
+    playlist = bool(re.search(r"\.(m3u8|mpd)(\?|$)", (stream_url or "").lower()))
+    if shutil.which("yt-dlp"):
+        return 'yt-dlp {headers} -f "bv*+ba/b" --merge-output-format mkv --restrict-filenames -o {out} {stream}'
+    if playlist:
+        return "ffmpeg -hide_banner -loglevel error -y -i {stream} -c copy {out}"
+    if shutil.which("curl"):
+        return "curl -fsSL --retry 3 --retry-delay 2 {headers} -o {out} {stream}"
+    return "wget -q --tries=3 {headers} -O {out} {stream}"
+
+
+def _tool_of(cmd: str) -> str:
+    head = cmd.strip().split()[0] if cmd.strip() else ""
+    return os.path.basename(head)
+
+
+def header_flags(headers: dict, cmd: str) -> str:
+    """Custom request headers (Fast Combo forwards some hosts' required headers)."""
+    if not headers:
+        return ""
+    tool = _tool_of(cmd)
+    pairs = [f"{k}: {v}" for k, v in headers.items()]
+    if tool == "yt-dlp":
+        return " ".join(f"--add-header {shlex.quote(p)}" for p in pairs)
+    if tool == "curl":
+        return " ".join(f"-H {shlex.quote(p)}" for p in pairs)
+    if tool == "wget":
+        return " ".join(f"--header={shlex.quote(p)}" for p in pairs)
+    if pairs:
+        log(f"  note: {_tool_of(cmd) or 'the downloader'} gets no custom headers "
+            f"({len(pairs)} required by this host); set TELESTREAM_DOWNLOAD_CMD to yt-dlp if it fails")
+    return ""
+
+
+# --------------------------------------------------------------------------- naming
+
+_ILLEGAL = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def clean(name: str) -> str:
+    """Make a string safe to use as a file/directory name."""
+    name = _ILLEGAL.sub(" ", name or "").strip()
+    name = re.sub(r"\s+", " ", name)
+    return name or "Unknown"
+
+
+def sxxexx(episode: str) -> str:
+    """Normalise '1x02', 's1e2', 'S01E02' -> 'S01E02'."""
+    m = re.search(r"(\d{1,2})\s*[xe]\s*(\d{1,3})", (episode or "").lower())
+    if not m:
+        return ""
+    return f"S{int(m.group(1)):02d}E{int(m.group(2)):02d}"
+
+
+def destination(kind: str, title: str, year, episode: str, dest_override: str | None):
+    """Return (directory, basename) using Plex naming conventions."""
+    if dest_override:
+        return os.path.abspath(os.path.expanduser(dest_override)), clean(title)
+
+    if kind in ("show", "series"):
+        code = sxxexx(episode)
+        show_dir = os.path.join(TV_DIR, clean(title))
+        if code:
+            season_dir = os.path.join(show_dir, f"Season {code[1:3]}")
+            base = f"{clean(title)} - {code}"
+        else:
+            season_dir = show_dir
+            base = clean(title)
+        return season_dir, base
+
+    folder = f"{clean(title)} ({year})" if year else clean(title)
+    return os.path.join(MOVIES_DIR, folder), folder
+
+
+# --------------------------------------------------------------------------- fetch
+
+def resolve_stream(url: str, title: str) -> str:
+    """Turn a Telestream page/id/stream URL into a direct media URL."""
+    if not RESOLVER_URL:
+        return url
+    if RESOLVER_URL.startswith("exec:"):
+        cmd = RESOLVER_URL[5:].format(url=shlex.quote(url), title=shlex.quote(title))
+        out = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=RESOLVE_TIMEOUT)
+        if out.returncode != 0:
+            raise RuntimeError(f"resolver command failed: {out.stderr.strip()[:400]}")
+        return out.stdout.strip().splitlines()[-1].strip()
+
+    api = RESOLVER_URL.format(url=urllib.parse.quote(url, safe=""), title=urllib.parse.quote(title))
+    with urllib.request.urlopen(api, timeout=RESOLVE_TIMEOUT) as resp:  # nosec - local resolver
+        body = resp.read().decode("utf-8", "replace").strip()
+
+    # Accept JSON ({...}) with a common stream-ish key, or a bare URL.
+    if body.startswith("{") or body.startswith("["):
+        data = json.loads(body)
+        items = data if isinstance(data, list) else [data]
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            for key in ("stream", "url", "file", "src", "videoUrl", "playUrl", "hls", "m3u8"):
+                value = item.get(key)
+                if isinstance(value, str) and value.startswith("http"):
+                    return value
+        raise RuntimeError(f"no stream URL found in resolver response: {body[:300]}")
+    return body
+
+
+def pick_extension(stream_url: str) -> str:
+    path = urllib.parse.urlparse(stream_url).path.lower()
+    for ext in (".mkv", ".mp4", ".m4v", ".avi", ".webm", ".ts", ".mov"):
+        if path.endswith(ext):
+            return ext
+    return DEFAULT_EXT  # .m3u8 and friends get remuxed into a container
+
+
+def download(stream_url: str, out_path: str, headers: dict | None = None) -> None:
+    cmd_template = DOWNLOAD_CMD or default_download_cmd(stream_url)
+    cmd = cmd_template.format(
+        stream=shlex.quote(stream_url),
+        out=shlex.quote(out_path),
+        headers=header_flags(headers or {}, cmd_template),
+    )
+    log(f"  exec: {cmd}")
+    proc = subprocess.run(cmd, shell=True, timeout=DOWNLOAD_TIMEOUT)
+    if proc.returncode != 0:
+        raise RuntimeError(f"download command exited {proc.returncode}")
+    if not os.path.exists(out_path):
+        raise RuntimeError(f"download produced no file at {out_path}")
+
+
+# ------------------------------------------------------- is it actually video?
+
+# Web pages saved with a .mkv extension are the classic cause of Plex error s1001:
+# the filename matches so the title appears in the library, but there is nothing
+# playable inside. Catch it here instead of letting Plex discover it.
+_HTML_MARKERS = (
+    b"<!doctype html", b"<html", b"<head", b"<script", b"<?xml",
+    b'"error"', b'"errors"', b"cloudflare", b"access denied", b"forbidden",
+    b"not found", b"captcha", b"please enable javascript", b"just a moment",
+)
+MIN_BYTES = int(os.environ.get("TELESTREAM_MIN_BYTES", str(20 * 1024 * 1024)))
+MIN_DURATION = float(os.environ.get("TELESTREAM_MIN_DURATION", "30"))
+VERIFY_MEDIA = os.environ.get("TELESTREAM_VERIFY_MEDIA", "1").lower() not in ("0", "false", "no")
+
+
+def validate_media(path: str, stream_url: str = "") -> dict:
+    """
+    Make sure what we downloaded is real, playable video. Raises on anything that
+    would show up in Plex as a title that refuses to play (error s1001).
+
+    Checks, cheapest first:
+      1. big enough to be an episode/movie
+      2. not an HTML/JSON error page wearing a video extension
+      3. ffprobe: has a video or audio stream, and is not a truncated stub
+    """
+    size = os.path.getsize(path)
+    if size < MIN_BYTES:
+        raise RuntimeError(
+            f"downloaded only {size} bytes (minimum {MIN_BYTES}); the host most likely "
+            f"returned an error page or the link died immediately"
+        )
+
+    with open(path, "rb") as fh:
+        head = fh.read(2048).lower()
+    hit = next((m for m in _HTML_MARKERS if m in head), None)
+    if hit:
+        snippet = head[:120].decode("utf-8", "replace").strip()
+        raise RuntimeError(
+            f"downloaded a web page, not a video (found {hit.decode()!r}: {snippet!r}). "
+            f"The host is behind a login/captcha/403 wall -- trying the next stream"
+        )
+
+    info = {"size_bytes": size}
+    ffprobe = shutil.which("ffprobe")
+    if not (VERIFY_MEDIA and ffprobe):
+        if VERIFY_MEDIA and not ffprobe:
+            log("  note: ffprobe missing (sudo apt install ffmpeg) -- skipping deep media check")
+        return info
+
+    try:
+        out = subprocess.run(
+            [ffprobe, "-v", "error", "-print_format", "json",
+             "-show_streams", "-show_format", path],
+            capture_output=True, text=True, timeout=120,
+        )
+        data = json.loads(out.stdout or "{}")
+    except Exception as exc:  # noqa: BLE001 - a probe failure must not lose a good file
+        log(f"  note: ffprobe could not run ({exc}); accepting the file")
+        return info
+
+    streams = data.get("streams") or []
+    video = [s for s in streams if s.get("codec_type") == "video"]
+    audio = [s for s in streams if s.get("codec_type") == "audio"]
+    fmt = (data.get("format") or {})
+    duration = float(fmt.get("duration") or 0)
+
+    if not video and not audio:
+        raise RuntimeError(
+            f"ffprobe found no video and no audio stream (format={fmt.get('format_name')}). "
+            f"This file would appear in Plex but fail with s1001 -- trying the next stream"
+        )
+    if duration and duration < MIN_DURATION:
+        raise RuntimeError(
+            f"file is only {duration:.0f}s long (minimum {MIN_DURATION:.0f}s) -- truncated download"
+        )
+
+    v = video[0] if video else {}
+    info.update({
+        "video_codec": v.get("codec_name") or "",
+        "audio_codec": (audio[0].get("codec_name") if audio else "") or "",
+        "width": v.get("width") or 0,
+        "height": v.get("height") or 0,
+        "duration_seconds": round(duration),
+        "container": fmt.get("format_name") or "",
+        "verified": True,
+    })
+    log(f"  verified: {info.get('width')}x{info.get('height')} {info.get('video_codec')} "
+        f"/ {info.get('audio_codec')} · {duration / 60:.0f} min")
+    return info
+
+
+# --------------------------------------------------------------------------- jobs
+
+def new_job(payload: dict) -> str:
+    job_id = uuid.uuid4().hex[:12]
+    job = {
+        "id": job_id,
+        "status": "queued",
+        "payload": payload,
+        "created": time.time(),
+        "updated": time.time(),
+        "error": None,
+        "file": None,
+    }
+    with JOBS_LOCK:
+        JOBS[job_id] = job
+        # crude ring buffer so memory does not grow forever
+        if len(JOBS) > MAX_JOBS:
+            oldest = sorted(JOBS.values(), key=lambda j: j["created"])[: len(JOBS) - MAX_JOBS]
+            for stale in oldest:
+                JOBS.pop(stale["id"], None)
+    return job_id
+
+
+def update_job(job_id: str, **fields) -> None:
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            return
+        job.update(fields)
+        job["updated"] = time.time()
+
+
+def parse_episode_numbers(episode: str, season) -> tuple[int, int]:
+    """('S01E02'|'1x02'|'2', 3) -> (season, episode) ints."""
+    code = sxxexx(episode)
+    if code:
+        return int(code[1:3]), int(code[4:])
+    m = re.search(r"(\d+)", str(episode or ""))
+    return int(season or 1), int(m.group(1)) if m else 1
+
+
+def fastcombo_plan(payload: dict) -> dict:
+    """
+    Ask your Stremio addons (through Fast Combo) for a title/episode and decide which
+    single stream to fetch. Fast Combo has already filtered and ranked; we keep the best
+    link that is actually downloadable and hold the rest as fallbacks.
+
+    Accepts: imdb (tt...) and/or title, kind (movie|show), year, season, episode.
+    """
+    if stremio_source is None:
+        raise RuntimeError("stremio_source.py is missing next to this script")
+    if not FASTCOMBO_ACCESS_KEY:
+        raise RuntimeError("FASTCOMBO_ACCESS_KEY is not set (the secret part of your Fast Combo link)")
+
+    imdb = str(payload.get("imdb") or "").strip()
+    title = str(payload.get("title") or "").strip()
+    kind = str(payload.get("kind") or "").strip().lower()
+    year = str(payload.get("year") or "").strip()
+
+    # --- title text -> IMDb id (Cinemeta, the same free addon Fast Combo uses) --------
+    if not imdb and title:
+        matches = stremio_source.search_titles(title, CINEMETA_URL)
+        if not matches:
+            raise RuntimeError(f"no IMDb match for {title!r} via Cinemeta ({CINEMETA_URL})")
+        want = "series" if kind in ("show", "series") else ("movie" if kind == "movie" else None)
+        best = None
+        for m in matches:                      # 1) right type AND right year
+            if year and m.get("year") and year in m["year"] and (not want or m["type"] == want):
+                best = m
+                break
+        if not best:                           # 2) right type
+            best = next((m for m in matches if not want or m["type"] == want), matches[0])
+        imdb = best["id"]
+        title = title or best.get("name", "")
+        year = year or (best.get("year") or "")[:4]
+        kind = kind or ("show" if best["type"] == "series" else "movie")
+        log(f"  matched {title!r} -> {imdb} ({best.get('type')}, {best.get('year')})")
+    if not imdb:
+        raise RuntimeError("need 'imdb' (tt...) or a 'title' to search for")
+
+    # --- canonical metadata so the Plex filename matches properly --------------------
+    info = {}
+    try:
+        info = stremio_source.title_info(imdb, CINEMETA_URL)
+    except Exception as exc:  # noqa: BLE001 - offline is fine, fall back to what we were given
+        log(f"  Cinemeta lookup unavailable ({exc}); using supplied title/year")
+    if info.get("ok"):
+        title = info.get("name") or title
+        year = year or info.get("year") or ""
+        kind = kind or ("show" if info.get("type") == "series" else "movie")
+
+    kind = kind or "movie"
+    stype = "series" if kind in ("show", "series") else "movie"
+    season, episode = parse_episode_numbers(payload.get("episode"), payload.get("season"))
+    sid = stremio_source.episode_id(imdb, season, episode) if stype == "series" else imdb
+    ep_code = f"S{season:02d}E{episode:02d}" if stype == "series" else ""
+
+    prefer = str(payload.get("prefer") or FASTCOMBO_PREFER)
+    candidates = stremio_source.fetch_streams(
+        FASTCOMBO_BASE_URL, FASTCOMBO_ACCESS_KEY, stype, sid, FASTCOMBO_TOKEN, FASTCOMBO_TIMEOUT
+    )
+    best, ordered = stremio_source.pick(candidates, prefer, FASTCOMBO_MAX_FALLBACKS)
+    log(f"  Fast Combo: {len(candidates)} streams, {len(ordered)} downloadable, prefer={prefer}")
+    if not candidates:
+        raise RuntimeError(f"Fast Combo returned no streams for {stype}/{sid} "
+                           f"(are your addons switched on at {FASTCOMBO_BASE_URL}?)")
+    if not best:
+        raise RuntimeError(f"Fast Combo returned {len(candidates)} streams but none are directly "
+                           f"downloadable (torrent/debrid-only links need a debrid service)")
+
+    return {
+        "imdb": imdb, "stype": stype, "sid": sid, "title": title, "year": year,
+        "kind": kind, "episode": ep_code, "season": season, "prefer": prefer,
+        "total": len(candidates), "downloadable": len(ordered),
+        "best": best, "ordered": ordered, "candidates": candidates,
+        "meta_ok": bool(info.get("ok")),
+    }
+
+
+def run_job(job_id: str, payload: dict) -> None:
+    url = (payload.get("url") or "").strip()
+    kind = (payload.get("kind") or "movie").strip().lower()
+    year = payload.get("year") or ""
+    episode = payload.get("episode") or ""
+    title = (payload.get("title") or "").strip()
+    part = None
+
+    try:
+        # ---- build the list of things to try, best first ----------------------------
+        attempts: list[dict] = []
+        if url:
+            # Direct/Telestream mode: one link (optionally via the local resolver).
+            if not title:
+                raise RuntimeError("'title' is required when you pass a direct 'url'")
+            update_job(job_id, status="resolving")
+            log(f"job {job_id}: resolving '{title}' <- {url}")
+            stream_url = resolve_stream(url, title)
+            log(f"job {job_id}: stream = {stream_url}")
+            attempts.append({"url": stream_url, "headers": {}, "info": {"mode": "direct url"}})
+        else:
+            # Fast Combo mode: ask all your addons, take the single best stream.
+            if not (payload.get("imdb") or title):
+                raise RuntimeError("pass 'url' (direct link) or 'imdb'/'title' (Fast Combo lookup)")
+            update_job(job_id, status="searching")
+            log(f"job {job_id}: asking Fast Combo for '{title or payload.get('imdb')}'")
+            plan = fastcombo_plan(payload)
+            title, year, kind, episode = plan["title"], plan["year"], plan["kind"], plan["episode"]
+            update_job(
+                job_id, imdb=plan["imdb"], stype=plan["stype"], sid=plan["sid"],
+                prefer=plan["prefer"], total_streams=plan["total"],
+                downloadable=plan["downloadable"], meta_ok=plan["meta_ok"],
+            )
+            for c in plan["ordered"]:
+                attempts.append({
+                    "url": c.url,
+                    "headers": c.headers,
+                    "info": {
+                        "mode": "fastcombo", "rank": c.index, "resolution": c.res_label,
+                        "size_bytes": c.size_bytes, "bitrate_mbps": c.bitrate_mbps,
+                        "codec": c.codec, "hdr": c.hdr, "source": c.source,
+                        "host": c.host, "addon": c.addon, "status": c.status,
+                        "start_seconds": c.start_seconds, "filename": c.filename,
+                    },
+                })
+            log(f"job {job_id}: best = {plan['best'].summary}")
+
+        # ---- where it lands in the library ------------------------------------------
+        target_dir, base = destination(kind, title, year, episode, payload.get("dest"))
+        os.makedirs(target_dir, exist_ok=True)
+        os.makedirs(STAGING, exist_ok=True)
+
+        ext = pick_extension(attempts[0]["url"])
+        final_path = os.path.join(target_dir, base + ext)
+        if os.path.exists(final_path):
+            log(f"job {job_id}: already present -> {final_path}")
+            update_job(job_id, status="done", file=final_path, skipped=True)
+            return
+
+        # ---- download, failing over to the next-best stream -------------------------
+        tried, errors = [], []
+        media_info: dict = {}
+        for n, attempt in enumerate(attempts, start=1):
+            stream_url = attempt["url"]
+            part = os.path.join(STAGING, f"{job_id}-{base}.part{ext}")
+            update_job(job_id, status="downloading", stream=stream_url,
+                       target=final_path, source=attempt["info"], attempt=n,
+                       attempts_total=len(attempts), tried=tried)
+            log(f"job {job_id}: attempt {n}/{len(attempts)} -> {part}")
+            try:
+                download(stream_url, part, attempt.get("headers"))
+                # Verify it is real video BEFORE it lands in the library -- a bad file
+                # in Plex shows up as a title that fails with "s1001 (Network)".
+                media_info = validate_media(part, stream_url)
+            except Exception as exc:  # noqa: BLE001 - try the next candidate
+                if part and os.path.exists(part):
+                    try:
+                        os.remove(part)
+                    except OSError:
+                        pass
+                part = None
+                errors.append(f"attempt {n}: {exc}")
+                tried.append({"rank": attempt["info"].get("rank", n), "url": stream_url,
+                              "error": str(exc)})
+                log(f"job {job_id}: attempt {n} failed ({exc})")
+                continue
+
+            try:
+                os.chmod(part, 0o644)  # readable by the plex user
+            except OSError:
+                pass
+            shutil.move(part, final_path)
+            part = None
+            log(f"job {job_id}: done -> {final_path}")
+            update_job(job_id, status="done", file=final_path, source=attempt["info"],
+                       media=media_info, attempt=n, tried=tried)
+            return
+
+        raise RuntimeError("every stream failed: " + " | ".join(errors[-3:]))
+    except Exception as exc:  # noqa: BLE001 - report everything back to the caller
+        if part and os.path.exists(part):
+            try:
+                os.remove(part)
+            except OSError:
+                pass
+        log(f"job {job_id}: FAILED - {exc}")
+        update_job(job_id, status="failed", error=str(exc))
+
+
+def enqueue(payload: dict) -> str:
+    job_id = new_job(payload)
+    threading.Thread(target=run_job, args=(job_id, payload), daemon=True).start()
+    return job_id
+
+
+def dashboard_html() -> str:
+    """Self-contained control panel: search a title, see the ranked streams, fetch the best."""
+    e = html.escape
+    fc_ready = bool(FASTCOMBO_BASE_URL and FASTCOMBO_ACCESS_KEY)
+    rows = {
+        "Fast Combo": (f"{FASTCOMBO_BASE_URL} · key {'set' if FASTCOMBO_ACCESS_KEY else 'MISSING'}"
+                       if fc_ready else "not configured"),
+        "Ranking": f"prefer={FASTCOMBO_PREFER} · up to {FASTCOMBO_MAX_FALLBACKS} fallbacks",
+        "Title search": CINEMETA_URL or "(Cinemeta)",
+        "Staging": STAGING,
+        "Movies library": MOVIES_DIR,
+        "TV library": TV_DIR,
+        "Downloader": _tool_of(DOWNLOAD_CMD or default_download_cmd()),
+        "Legacy resolver": RESOLVER_URL or "(off — Fast Combo is the source)",
+    }
+    cfg = "".join(
+        f'<div class="cfg"><span>{e(k)}</span><code>{e(str(v))}</code></div>'
+        for k, v in rows.items()
+    )
+    warn = "" if fc_ready else (
+        '<p class="warn">Fast Combo is not configured yet. Set <code>FASTCOMBO_BASE_URL</code> and '
+        '<code>FASTCOMBO_ACCESS_KEY</code>, or use the direct-URL form below.</p>')
+    return _PAGE.replace("{{CONFIG}}", cfg).replace("{{WARN}}", warn)
+
+
+_PAGE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mwatcher &middot; Stremio addons &rarr; Plex</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+         background:#0d1117; color:#e6edf3; }
+  .wrap { max-width:1000px; margin:0 auto; padding:24px 18px 60px; }
+  h1 { font-size:22px; margin:0 0 2px; }
+  .sub { color:#8b949e; margin:0 0 22px; font-size:14px; }
+  .dot { display:inline-block; width:9px; height:9px; border-radius:50%;
+         background:#3fb950; margin-right:7px; box-shadow:0 0 8px #3fb950; }
+  .card { background:#161b22; border:1px solid #21262d; border-radius:12px;
+          padding:18px; margin-bottom:20px; }
+  .card h2 { font-size:13px; text-transform:uppercase; letter-spacing:.08em;
+             color:#8b949e; margin:0 0 14px; }
+  .cfg { display:flex; gap:12px; padding:6px 0; border-bottom:1px dashed #21262d; font-size:13.5px; }
+  .cfg:last-child { border-bottom:0; }
+  .cfg span { flex:0 0 140px; color:#8b949e; }
+  .cfg code { flex:1; word-break:break-all; color:#79c0ff; font-size:12.5px; }
+  form { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+  form.inline { grid-template-columns:1fr auto; }
+  label { font-size:12.5px; color:#8b949e; display:block; margin-bottom:4px; }
+  input,select { width:100%; padding:9px 11px; border-radius:8px; font-size:14px;
+                 background:#0d1117; border:1px solid #30363d; color:#e6edf3; }
+  input:focus,select:focus { outline:none; border-color:#58a6ff; }
+  .full { grid-column:1 / -1; }
+  button { padding:10px 14px; border:0; border-radius:8px; background:#238636; color:#fff;
+           font-size:14px; font-weight:600; cursor:pointer; }
+  button:hover { background:#2ea043; }
+  button:disabled { background:#30363d; color:#8b949e; cursor:default; }
+  button.ghost { background:#21262d; color:#e6edf3; }
+  button.ghost:hover { background:#30363d; }
+  button.sm { padding:5px 10px; font-size:12.5px; }
+  table { width:100%; border-collapse:collapse; font-size:13.5px; }
+  th,td { text-align:left; padding:9px 8px; border-bottom:1px solid #21262d; vertical-align:top; }
+  th { color:#8b949e; font-weight:600; font-size:11.5px; text-transform:uppercase; letter-spacing:.05em; }
+  td code { color:#79c0ff; font-size:12px; word-break:break-all; }
+  .badge { padding:2px 9px; border-radius:20px; font-size:11.5px; font-weight:600; white-space:nowrap; }
+  .queued,.resolving,.searching,.downloading { background:#1f2d3d; color:#79c0ff; }
+  .done { background:#12261e; color:#3fb950; }
+  .failed { background:#2d1618; color:#f85149; }
+  .best { background:#12261e; color:#3fb950; }
+  .skip { background:#21262d; color:#8b949e; }
+  .fb { background:#1f2d3d; color:#79c0ff; }
+  .empty { color:#8b949e; padding:16px 0; text-align:center; font-size:13.5px; }
+  .note { font-size:12.5px; color:#8b949e; margin:10px 0 0; }
+  .warn { background:#2d2410; border:1px solid #5c4a17; color:#e3b341; padding:10px 12px;
+          border-radius:8px; font-size:13px; margin:0 0 14px; }
+  .row { display:flex; gap:10px; align-items:center; justify-content:space-between;
+         padding:9px 0; border-bottom:1px dashed #21262d; }
+  .row:last-child { border-bottom:0; }
+  .row .t { font-weight:600; }
+  .row .m { color:#8b949e; font-size:12.5px; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:20px; background:#21262d;
+          color:#8b949e; font-size:11.5px; margin-left:6px; }
+  .hidden { display:none; }
+  .toast { position:fixed; bottom:20px; left:50%; transform:translateX(-50%); background:#161b22;
+           border:1px solid #30363d; padding:10px 16px; border-radius:8px; font-size:13.5px;
+           opacity:0; transition:opacity .2s; pointer-events:none; max-width:90vw; }
+  .toast.show { opacity:1; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1><span class="dot"></span>Mwatcher &mdash; Stremio addons &rarr; Plex</h1>
+  <p class="sub">Search a title, let <b>Fast Combo</b> ask all your addons at once, then download the
+     single best stream into your Plex library. API: <code>GET /search</code> &middot;
+     <code>GET /streams</code> &middot; <code>POST /fetch</code> &middot; <code>GET /jobs</code>.</p>
+
+  <div class="card">
+    <h2>Server configuration</h2>
+    {{WARN}}
+    {{CONFIG}}
+  </div>
+
+  <div class="card">
+    <h2>1 &middot; Find a title</h2>
+    <form id="search" class="inline">
+      <div><label>Search your addons' catalogues (Cinemeta)</label>
+        <input name="q" placeholder="Dune, Breaking Bad, The Matrix&hellip;" autocomplete="off"></div>
+      <div style="align-self:end"><button type="submit">Search</button></div>
+    </form>
+    <div id="results"></div>
+  </div>
+
+  <div class="card hidden" id="streamcard">
+    <h2>2 &middot; Streams from your addons <span id="sinfo" class="pill"></span></h2>
+    <div style="display:flex;gap:10px;align-items:center;margin-bottom:12px;flex-wrap:wrap">
+      <label style="margin:0">Rank by
+        <select id="prefer" style="width:auto;margin-left:6px">
+          <option value="best">best (Fast Combo's order)</option>
+          <option value="fastest">fastest start</option>
+          <option value="smallest">smallest file</option>
+          <option value="4kfirst">4K first</option>
+          <option value="1080first">1080p first</option>
+        </select>
+      </label>
+      <label style="margin:0">Season <input id="season" type="number" value="1" min="1" style="width:70px"></label>
+      <label style="margin:0">Episode <input id="episode" type="number" value="1" min="1" style="width:70px"></label>
+      <button class="ghost sm" id="reload" type="button">Re-query</button>
+      <button class="sm" id="fetchbest" type="button" style="margin-left:auto">Fetch best into Plex</button>
+    </div>
+    <table><thead><tr><th>Pick</th><th>Quality</th><th>Size</th><th>Speed</th><th>From</th><th></th></tr></thead>
+      <tbody id="srows"></tbody></table>
+    <div id="sempty" class="empty hidden">No streams.</div>
+    <p class="note">Fast Combo has already removed CAM/TS copies, dead links, duplicates and files too big
+      to stream smoothly. Rows marked <span class="badge skip">skip</span> are torrents &mdash; they need a
+      debrid service, so the bridge cannot download them directly.</p>
+  </div>
+
+  <div class="card">
+    <h2>Fetch directly (skip the search)</h2>
+    <form id="direct">
+      <div><label>IMDb id &mdash; or a direct stream URL</label>
+        <input name="imdb" placeholder="tt1160419"></div>
+      <div><label>Direct URL (optional, bypasses addons)</label>
+        <input name="url" placeholder="http://127.0.0.1:8888/stream/tt1160419"></div>
+      <div><label>Title</label><input name="title" placeholder="Dune"></div>
+      <div><label>Year</label><input name="year" placeholder="2021"></div>
+      <div><label>Kind</label><select name="kind">
+        <option value="">auto</option><option value="movie">Movie</option><option value="show">TV show</option>
+      </select></div>
+      <div><label>Episode (S01E02)</label><input name="episode" placeholder="S01E02"></div>
+      <div class="full"><button type="submit">Fetch into Plex</button></div>
+    </form>
+  </div>
+
+  <div class="card">
+    <h2>Jobs <span id="count" class="pill"></span></h2>
+    <table><thead><tr><th>Status</th><th>Title</th><th>Source picked</th><th>Result / error</th><th>Updated</th></tr></thead>
+      <tbody id="rows"></tbody></table>
+    <div id="empty" class="empty">No jobs yet.</div>
+  </div>
+</div>
+<div id="toast" class="toast"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+let chosen = null;   // the title picked from search results
+
+function esc(s){ return (s==null?'':String(s)).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function ago(t){ const s=Math.max(0,(Date.now()/1000-t)|0); return s<60? s+'s ago' : (s/60|0)+'m ago'; }
+function gb(b){ if(!b) return ''; return b>=1e9 ? (b/1e9).toFixed(2)+' GB' : Math.round(b/1e6)+' MB'; }
+function ping(m){ const t=$('toast'); t.textContent=m; t.classList.add('show');
+  setTimeout(()=>t.classList.remove('show'),2600); }
+async function getJSON(u){ const r=await fetch(u); const d=await r.json(); if(!r.ok) throw new Error(d.error||r.status); return d; }
+
+// ---- 1. search -------------------------------------------------------------------
+$('search').addEventListener('submit', async ev=>{
+  ev.preventDefault();
+  const q = ev.target.q.value.trim(); if(!q) return;
+  $('results').innerHTML = '<div class="empty">Searching&hellip;</div>';
+  try{
+    const d = await getJSON('/search?q='+encodeURIComponent(q));
+    if(!d.metas.length){ $('results').innerHTML='<div class="empty">No matches.</div>'; return; }
+    $('results').innerHTML = d.metas.map(m=>
+      '<div class="row"><div><span class="t">'+esc(m.name)+'</span>'
+      +'<span class="pill">'+esc(m.year||'?')+'</span>'
+      +'<span class="pill">'+esc(m.type)+'</span>'
+      +'<div class="m">'+esc(m.id)+'</div></div>'
+      +'<button class="ghost sm" data-id="'+esc(m.id)+'" data-type="'+esc(m.type)+'" data-name="'
+      +esc(m.name)+'" data-year="'+esc((m.year||'').slice(0,4))+'">Show streams</button></div>'
+    ).join('');
+    $('results').querySelectorAll('button').forEach(b=>b.addEventListener('click',()=>select(b.dataset)));
+  }catch(e){ $('results').innerHTML='<div class="empty">Search failed: '+esc(e.message)+'</div>'; }
+});
+
+// ---- 2. streams ------------------------------------------------------------------
+function select(d){
+  chosen = { id:d.id, type:d.type==='series'?'show':'movie', name:d.name, year:d.year };
+  $('streamcard').classList.remove('hidden');
+  $('season').parentElement.style.display = chosen.type==='show' ? '' : 'none';
+  $('episode').parentElement.style.display = chosen.type==='show' ? '' : 'none';
+  $('sinfo').textContent = d.name+' ('+(d.year||'?')+')';
+  loadStreams();
+  $('streamcard').scrollIntoView({behavior:'smooth', block:'start'});
+}
+async function loadStreams(){
+  if(!chosen) return;
+  const stype = chosen.type==='show' ? 'series' : 'movie';
+  let u = '/streams?type='+stype+'&id='+encodeURIComponent(chosen.id)
+        + '&prefer='+encodeURIComponent($('prefer').value);
+  if(stype==='series') u += '&season='+($('season').value||1)+'&episode='+($('episode').value||1);
+  $('srows').innerHTML = '<tr><td colspan="6" class="empty">Asking all your addons&hellip;</td></tr>';
+  try{
+    const d = await getJSON(u);
+    $('sinfo').textContent = chosen.name+' · '+d.total+' streams · '+d.downloadable+' downloadable';
+    $('sempty').classList.toggle('hidden', d.streams.length>0);
+    $('fetchbest').disabled = !d.streams.some(s=>s.best);
+    $('srows').innerHTML = d.streams.map(s=>{
+      const tag = s.best ? '<span class="badge best">BEST</span>'
+                : s.fallback ? '<span class="badge fb">fallback</span>'
+                : '<span class="badge skip">skip</span>';
+      const q = [s.resolution, s.codec, s.hdr, s.source].filter(Boolean).join(' · ')||'—';
+      const sp = (s.start_seconds!=null? s.start_seconds.toFixed(1)+'s start · ':'')+(s.status||'');
+      const from = [s.host, s.addon].filter(Boolean).join(' · ')||'—';
+      return '<tr><td>'+tag+' <span class="m">#'+s.index+'</span></td><td>'+esc(q)+'</td>'
+           + '<td>'+esc(gb(s.size_bytes))+(s.bitrate_mbps?'<div class="m">'+s.bitrate_mbps.toFixed(1)+' Mbps</div>':'')+'</td>'
+           + '<td>'+esc(sp)+'</td><td>'+esc(from)+'</td>'
+           + '<td>'+(s.downloadable?'<button class="ghost sm" data-url="'+esc(s.url)+'">Fetch this</button>':'<span class="m">torrent</span>')+'</td></tr>';
+    }).join('');
+    $('srows').querySelectorAll('button').forEach(b=>b.addEventListener('click',()=>fetchNow({url:b.dataset.url})));
+  }catch(e){
+    $('srows').innerHTML = '<tr><td colspan="6" class="empty">Failed: '+esc(e.message)+'</td></tr>';
+    $('fetchbest').disabled = true;
+  }
+}
+$('prefer').addEventListener('change', loadStreams);
+$('reload').addEventListener('click', loadStreams);
+$('season').addEventListener('change', loadStreams);
+$('episode').addEventListener('change', loadStreams);
+$('fetchbest').addEventListener('click', ()=>fetchNow({}));
+
+// ---- 3. fetch --------------------------------------------------------------------
+async function fetchNow(extra){
+  const body = Object.assign({
+    imdb: chosen? chosen.id : '', title: chosen? chosen.name : '', year: chosen? chosen.year : '',
+    kind: chosen? chosen.type : '', prefer: $('prefer').value,
+    season: chosen&&chosen.type==='show' ? parseInt($('season').value||1,10) : undefined,
+    episode: chosen&&chosen.type==='show' ? 'S'+String($('season').value||1).padStart(2,'0')
+             +'E'+String($('episode').value||1).padStart(2,'0') : '',
+  }, extra||{});
+  Object.keys(body).forEach(k=>{ if(body[k]===undefined||body[k]==='') delete body[k]; });
+  try{
+    const r = await fetch('/fetch',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(body)});
+    const d = await r.json();
+    ping(r.ok ? 'Queued job '+d.job : 'Error: '+(d.error||r.status));
+    setTimeout(refreshJobs, 400);
+  }catch(e){ ping('Request failed'); }
+}
+$('direct').addEventListener('submit', ev=>{
+  ev.preventDefault();
+  const fd = new FormData(ev.target), body = {};
+  for(const [k,v] of fd.entries()) if(v.trim()) body[k]=v.trim();
+  if(!body.title && !body.imdb){ ping('Give a title or an IMDb id'); return; }
+  chosen = null;
+  fetch('/fetch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+    .then(r=>r.json()).then(d=>ping('Queued job '+d.job)).catch(()=>ping('Request failed'));
+  setTimeout(refreshJobs, 400);
+});
+
+// ---- 4. jobs ---------------------------------------------------------------------
+async function refreshJobs(){
+  try{
+    const d = await getJSON('/jobs');
+    $('count').textContent = d.count? d.count+' total' : '';
+    $('empty').style.display = d.jobs.length? 'none':'block';
+    $('rows').innerHTML = d.jobs.map(j=>{
+      const p=j.payload||{}, s=j.source||{};
+      const t = (p.title||j.imdb||'?')+(p.year?' ('+p.year+')':'')+(p.episode?' '+p.episode:'');
+      const src = s.mode==='fastcombo'
+        ? [s.resolution, gb(s.size_bytes), s.start_seconds!=null?s.start_seconds.toFixed(1)+'s':'',
+           s.source, s.addon].filter(Boolean).join(' · ')
+        : (s.mode||'—');
+      const res = j.status==='done' ? '<code>'+esc(j.file||'')+'</code>'
+                + (j.skipped?' <span class="pill">already had it</span>':'')
+                + (j.attempt>1?' <span class="pill">used fallback #'+j.attempt+'</span>':'')
+                + (j.media&&j.media.verified?' <span class="pill">verified video</span>':'')
+                + (j.tried||[]).map(t=>'<div class="m">rejected #'+(t.rank!=null?t.rank:'?')
+                     +': '+esc(String(t.error||'').slice(0,140))+'</div>').join('')
+                : j.status==='failed' ? esc(j.error||'')
+                + (j.tried||[]).map(t=>'<div class="m">rejected #'+(t.rank!=null?t.rank:'?')
+                     +': '+esc(String(t.error||'').slice(0,140))+'</div>').join('')
+                : esc(j.stream||j.status);
+      return '<tr><td><span class="badge '+esc(j.status)+'">'+esc(j.status)+'</span></td>'
+           + '<td>'+esc(t)+(j.imdb?'<div class="m">'+esc(j.imdb)+'</div>':'')+'</td>'
+           + '<td class="m">'+esc(src)+'</td><td>'+res+'</td><td>'+ago(j.updated)+'</td></tr>';
+    }).join('');
+  }catch(e){}
+}
+refreshJobs(); setInterval(refreshJobs, 3000);
+</script>
+</body></html>
+"""
+
+
+# --------------------------------------------------------------------------- http
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "mwatcher-telestream-bridge/1.0"
+
+    def _send(self, code: int, body: dict) -> None:
+        raw = json.dumps(body, indent=2).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def _send_html(self, code: int, page: str) -> None:
+        raw = page.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def do_GET(self) -> None:  # noqa: N802
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        qs = {k: v[0] for k, v in urllib.parse.parse_qs(parsed.query).items()}
+
+        if path in ("/", "/index.html", "/ui"):
+            self._send_html(200, dashboard_html())
+        elif path == "/healthz":
+            self._send(200, {"ok": True, "fastcombo": bool(FASTCOMBO_ACCESS_KEY),
+                            "stremio_source": stremio_source is not None})
+        elif path == "/jobs":
+            with JOBS_LOCK:
+                jobs = sorted(JOBS.values(), key=lambda j: j["created"], reverse=True)
+            self._send(200, {"count": len(jobs), "jobs": jobs[:50]})
+        elif path == "/config":
+            self._send(200, {
+                "fastcombo_base_url": FASTCOMBO_BASE_URL,
+                "fastcombo_access_key": ("*" * 6 + FASTCOMBO_ACCESS_KEY[-4:]) if FASTCOMBO_ACCESS_KEY else "",
+                "fastcombo_ready": bool(FASTCOMBO_BASE_URL and FASTCOMBO_ACCESS_KEY),
+                "prefer": FASTCOMBO_PREFER, "max_fallbacks": FASTCOMBO_MAX_FALLBACKS,
+                "cinemeta_url": CINEMETA_URL, "staging": STAGING,
+                "movies_dir": MOVIES_DIR, "tv_dir": TV_DIR,
+                "downloader": _tool_of(DOWNLOAD_CMD or default_download_cmd()),
+                "resolver_url": RESOLVER_URL,
+            })
+        elif path == "/search":
+            # Title text -> IMDb matches (Cinemeta), so the dashboard can offer a picker.
+            q = (qs.get("q") or "").strip()
+            if not q:
+                self._send(400, {"error": "need ?q=<title>"})
+            elif stremio_source is None:
+                self._send(500, {"error": "stremio_source.py not importable"})
+            else:
+                try:
+                    metas = stremio_source.search_titles(q, CINEMETA_URL)
+                    self._send(200, {"ok": True, "query": q, "count": len(metas), "metas": metas})
+                except Exception as exc:  # noqa: BLE001
+                    self._send(502, {"ok": False, "error": f"Cinemeta search failed: {exc}"})
+        elif path == "/streams":
+            # Ranked Fast Combo candidates for one title/episode, best one flagged.
+            stype = (qs.get("type") or "movie").strip().lower()
+            sid = (qs.get("id") or "").strip()
+            if not sid:
+                self._send(400, {"error": "need ?id=tt1234567 (and ?type=series&season=1&episode=2)"})
+            elif stremio_source is None:
+                self._send(500, {"error": "stremio_source.py not importable"})
+            else:
+                try:
+                    stype = "series" if stype in ("series", "show") else stype
+                    if stype == "series":
+                        sid = stremio_source.episode_id(sid.split(":")[0], qs.get("season", 1), qs.get("episode", 1))
+                    prefer = (qs.get("prefer") or FASTCOMBO_PREFER)
+                    cands = stremio_source.fetch_streams(
+                        FASTCOMBO_BASE_URL, FASTCOMBO_ACCESS_KEY, stype, sid, FASTCOMBO_TOKEN)
+                    best, ordered = stremio_source.pick(cands, prefer, FASTCOMBO_MAX_FALLBACKS)
+                    ranked = stremio_source.rank(cands, prefer)
+                    streams = []
+                    for c in ranked:
+                        d = c.to_dict()
+                        d["best"] = bool(best and c.index == best.index)
+                        d["fallback"] = any(o.index == c.index for o in ordered)
+                        streams.append(d)
+                    self._send(200, {
+                        "ok": True, "stype": stype, "sid": sid, "prefer": prefer,
+                        "total": len(cands), "downloadable": len(ordered),
+                        "best_index": best.index if best else None, "streams": streams,
+                    })
+                except Exception as exc:  # noqa: BLE001
+                    self._send(502, {"ok": False, "error": str(exc)})
+        else:
+            self._send(404, {"error": "try GET /jobs, /search?q=, /streams?id=tt... or POST /fetch"})
+
+    def do_POST(self) -> None:  # noqa: N802
+        path = urllib.parse.urlparse(self.path).path
+        if path != "/fetch":
+            self._send(404, {"error": "POST /fetch"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            payload = json.loads(self.rfile.read(length).decode() or "{}")
+            if not isinstance(payload, dict):
+                raise ValueError("body must be a JSON object")
+        except Exception as exc:  # noqa: BLE001
+            self._send(400, {"error": f"bad JSON: {exc}"})
+            return
+
+        job_id = enqueue(payload)
+        self._send(202, {"job": job_id, "status": "queued", "poll": f"/jobs"})
+
+    def log_message(self, fmt: str, *args) -> None:  # keep journald tidy
+        log(f"{self.address_string()} {fmt % args}")
+
+
+def serve() -> None:
+    for directory in (STAGING, MOVIES_DIR, TV_DIR):
+        os.makedirs(directory, exist_ok=True)
+    httpd = ThreadingHTTPServer((BRIDGE_HOST, BRIDGE_PORT), Handler)
+    log(f"listening on http://{BRIDGE_HOST}:{BRIDGE_PORT} (POST /fetch, GET /jobs)")
+    log(f"staging={STAGING} movies={MOVIES_DIR} tv={TV_DIR}")
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+# --------------------------------------------------------------------------- cli
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        description="Fetch the best stream from your Stremio addons (Fast Combo) into a Plex library.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__.split("Configuration is by environment variable")[0],
+    )
+    parser.add_argument("serve", nargs="?", help="run the HTTP bridge/dashboard instead of a one-shot fetch")
+    # what to fetch
+    parser.add_argument("--title", help="movie or show title (searched on Cinemeta if no --imdb)")
+    parser.add_argument("--imdb", help="IMDb id, e.g. tt1375666 (skips the search)")
+    parser.add_argument("--year", help="4-digit year, disambiguates remakes")
+    parser.add_argument("--kind", choices=["movie", "show", "series"], help="default: auto-detected")
+    parser.add_argument("--season", type=int, default=1, help="season number (shows)")
+    parser.add_argument("--episode", help="episode code (S01E02 / 1x02) or number (shows)")
+    parser.add_argument("--prefer", choices=list(stremio_source.PREFER_ORDER) if stremio_source else None,
+                        help="how to rank Fast Combo's list (default: best)")
+    # direct-link mode (the old Telestream behaviour)
+    parser.add_argument("--url", help="direct/Telestream stream URL instead of an addon lookup")
+    parser.add_argument("--stream", help="same as --url but skip the local resolver")
+    parser.add_argument("--dest", help="override destination folder (skips Plex naming rules)")
+    # inspect instead of fetching
+    parser.add_argument("--search", action="store_true", help="just list IMDb matches for --title")
+    parser.add_argument("--list-streams", action="store_true",
+                        help="just list the ranked candidates Fast Combo returns, download nothing")
+    args = parser.parse_args(argv)
+
+    if args.serve == "serve":
+        serve()
+        return 0
+    if stremio_source is None and not (args.url or args.stream):
+        parser.error("stremio_source.py is missing, so only --url/--stream mode is available")
+
+    # --- inspect: title search -------------------------------------------------------
+    if args.search:
+        if not args.title:
+            parser.error("--search needs --title")
+        print(json.dumps(stremio_source.search_titles(args.title, CINEMETA_URL), indent=2))
+        return 0
+
+    # --- inspect: ranked candidates, no download -------------------------------------
+    if args.list_streams:
+        if not (args.imdb or args.title):
+            parser.error("--list-streams needs --imdb or --title")
+        plan = fastcombo_plan(vars(args) | {"kind": args.kind or ""})
+        print(f"{plan['title']} ({plan['year']}) {plan['imdb']} -> {plan['stype']}/{plan['sid']}")
+        print(f"{plan['total']} streams from Fast Combo, {plan['downloadable']} downloadable, "
+              f"prefer={plan['prefer']}\n")
+        for c in stremio_source.rank(plan["candidates"], plan["prefer"])[:20]:
+            flag = "BEST" if plan["best"].index == c.index else ("    " if c.downloadable else "skip")
+            print(f"[{flag}] #{c.index:<3} {c.summary or '(no details)'}")
+        return 0 if plan["best"] else 1
+
+    # --- fetch -----------------------------------------------------------------------
+    direct = args.stream or args.url
+    if direct and not args.title and not args.imdb:
+        parser.error("--url/--stream needs --title (for the Plex filename)")
+    if not direct and not (args.imdb or args.title):
+        parser.error("need --imdb or --title (Fast Combo lookup), or --url/--stream (direct link), "
+                     "or the 'serve' subcommand")
+
+    payload = {
+        "title": args.title or "",
+        "imdb": args.imdb or "",
+        "url": direct or "",
+        "year": args.year or "",
+        "kind": args.kind or "",
+        "season": args.season,
+        "episode": args.episode or "",
+        "prefer": args.prefer or "",
+        "dest": args.dest,
+    }
+    if args.stream:
+        # --stream means the URL is already direct: bypass the resolver for this job only
+        global RESOLVER_URL  # noqa: PLW0603
+        RESOLVER_URL = ""
+
+    job_id = new_job(payload)
+    run_job(job_id, payload)  # foreground: the exit code is useful in scripts/cron
+    with JOBS_LOCK:
+        job = dict(JOBS[job_id])
+    print(json.dumps(job, indent=2))
+    return 0 if job.get("status") == "done" else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

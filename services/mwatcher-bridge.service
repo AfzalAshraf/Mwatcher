@@ -1,0 +1,96 @@
+# Mwatcher bridge -- Stremio addons (via Fast Combo) -> your Plex library.
+#
+# Runs scripts/telestream_to_plex.py as a small local service with a web dashboard:
+#
+#   GET  /                 dashboard: search a title, see the ranked streams, fetch the best
+#   GET  /search?q=dune    title -> IMDb matches (Cinemeta)
+#   GET  /streams?id=tt..  ranked candidates from all your addons, best one flagged
+#   POST /fetch            {"imdb":"tt1160419"} or {"title":"Dune","year":2021,"kind":"movie"}
+#   GET  /jobs             progress + which stream was picked and why
+#
+# For each request it asks Fast Combo (which asks all your addons at once), takes the best
+# link that is actually downloadable, fetches it into staging, renames it the way Plex
+# expects, and moves it into the library. If that link dies mid-download it automatically
+# falls back to the next-best one.
+#
+# Install:
+#   mkdir -p /home/afine/.config/mwatcher
+#   cp config/bridge.env.example /home/afine/.config/mwatcher/bridge.env
+#   nano /home/afine/.config/mwatcher/bridge.env     # paste your FC_ACCESS_KEY
+#   chmod 600 /home/afine/.config/mwatcher/bridge.env
+#   sudo cp services/mwatcher-bridge.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now mwatcher-bridge
+#   sudo journalctl -u mwatcher-bridge -f
+#
+# Needs a downloader on PATH: yt-dlp (best) or ffmpeg, plus curl as a fallback.
+
+[Unit]
+Description=Mwatcher bridge (Stremio addons to Plex library)
+Documentation=file:///home/afine/Mwatcher/docs/PLEX_GLOBAL_ACCESS.md
+After=network-online.target fastcombo.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=afine
+Group=afine
+WorkingDirectory=/home/afine/Mwatcher
+ExecStart=/usr/bin/python3 /home/afine/Mwatcher/scripts/telestream_to_plex.py serve
+Restart=always
+RestartSec=5
+
+# --- the bridge's own endpoint (loopback only; reverse-proxy it if you want it remote) --
+Environment=BRIDGE_HOST=127.0.0.1
+Environment=BRIDGE_PORT=8889
+
+# --- where media lands: these must be the folders your Plex libraries point at ---------
+# NOTE: quote the WHOLE assignment when a path contains a space, otherwise systemd
+# silently drops the line ('Invalid environment assignment').
+Environment=TELESTREAM_STAGING=/home/afine/media/staging
+Environment=TELESTREAM_MOVIES_DIR=/home/afine/media/Movies
+Environment="TELESTREAM_TV_DIR=/home/afine/media/TV Shows"
+
+# --- your addons, through Fast Combo ---------------------------------------------------
+Environment=FASTCOMBO_BASE_URL=http://127.0.0.1:7000
+# best | fastest | smallest | 4kfirst | 1080first
+#   best    = trust Fast Combo's order (tested-working first, best picture for the size)
+#   fastest = the link that starts soonest -- "single best speed"
+Environment=FASTCOMBO_PREFER=fastest
+Environment=FASTCOMBO_MAX_FALLBACKS=4
+Environment=CINEMETA_URL=https://v3-cinemeta.strem.io
+
+# FC_ACCESS_KEY (and optionally FASTCOMBO_TOKEN) live here, chmod 600:
+EnvironmentFile=/home/afine/.config/mwatcher/bridge.env
+
+# --- the downloader --------------------------------------------------------------------
+# Placeholders {stream} {out} {headers} are substituted ALREADY SHELL-QUOTED, so use them
+# bare -- do not add your own quotes around them.
+# Default: yt-dlp when installed, else curl for plain files / ffmpeg for HLS.
+#Environment=TELESTREAM_DOWNLOAD_CMD=yt-dlp {headers} -f bv*+ba/b --merge-output-format mkv --restrict-filenames -o {out} {stream}
+#Environment=TELESTREAM_DOWNLOAD_CMD=ffmpeg -hide_banner -loglevel error -y -i {stream} -c copy {out}
+
+# Optional legacy hook: a local resolver that turns a URL into a direct media link.
+# Leave empty -- Fast Combo is the source now.
+#Environment=TELESTREAM_RESOLVER_URL=http://127.0.0.1:8888/resolve?url={url}
+
+# --- verifying downloads --------------------------------------------------------------
+# A host that returns an HTML error page instead of a video is the #1 cause of Plex
+# error "s1001 (Network)": the filename matches so the title appears in your library,
+# but there is nothing playable inside. The bridge checks every download BEFORE it
+# enters the library (size, HTML/JSON sniff, then ffprobe for real video+audio
+# streams) and fails over to the next-best stream when a file is bad.
+Environment=TELESTREAM_MIN_BYTES=20971520
+Environment=TELESTREAM_MIN_DURATION=30
+Environment=TELESTREAM_VERIFY_MEDIA=1
+
+# --- tuning ----------------------------------------------------------------------------
+Environment=TELESTREAM_DOWNLOAD_TIMEOUT=10800
+Environment=FASTCOMBO_TIMEOUT=60
+Environment=TELESTREAM_EXT=.mkv
+Nice=10
+CPUWeight=60
+# Downloads + remuxing can be heavy; raise or remove if you see OOM kills.
+MemoryMax=2G
+
+[Install]
+WantedBy=multi-user.target

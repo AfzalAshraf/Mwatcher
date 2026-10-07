@@ -1,0 +1,57 @@
+# Fast Combo -- your Stremio addons, merged into one ranked list.
+# Repo: https://github.com/AfzalAshraf/stremio-addons
+#
+# This is the "addon" half of the setup. Fast Combo asks every addon you configure at the
+# same time, drops CAM/TS copies, dead links, duplicates and files too big to stream
+# smoothly, live-probes what is left, and returns them best-first. The Mwatcher bridge then
+# takes that #1 link and puts the file into your Plex library.
+#
+# It is bound to 127.0.0.1 on purpose: only the bridge on this machine may use it. If you
+# also want Fast Combo in the Stremio app on your phone/TV, see docs/PLEX_GLOBAL_ACCESS.md
+# (put it behind your own HTTPS reverse proxy, and set FC_PUBLIC_URL).
+#
+# Setup:
+#   git clone https://github.com/AfzalAshraf/stremio-addons /home/afine/stremio-addons
+#   sudo apt install -y nodejs            # needs Node 18+
+#   mkdir -p /home/afine/.config/mwatcher /home/afine/.local/share/fastcombo
+#   cp config/fastcombo.env.example /home/afine/.config/mwatcher/fastcombo.env
+#   nano /home/afine/.config/mwatcher/fastcombo.env     # set the key + password
+#   chmod 600 /home/afine/.config/mwatcher/fastcombo.env
+#   sudo cp services/fastcombo.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now fastcombo
+#   sudo journalctl -u fastcombo -f
+#
+# Then open the control panel and add your addons:
+#   http://127.0.0.1:7000/<FC_ACCESS_KEY>/configure
+
+[Unit]
+Description=Fast Combo (merged Stremio addons) for the Mwatcher Plex bridge
+Documentation=https://github.com/AfzalAshraf/stremio-addons
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=afine
+Group=afine
+WorkingDirectory=/home/afine/stremio-addons
+ExecStart=/usr/bin/node /home/afine/stremio-addons/server.js
+Restart=always
+RestartSec=5
+
+# Loopback only -- the access key is a secret, do not expose this port to the internet.
+Environment=HOST=127.0.0.1
+Environment=PORT=7000
+# Where Fast Combo keeps your addon list + "seen links" (live sync without reinstalling).
+Environment=FC_DATA_FILE=/home/afine/.local/share/fastcombo/kv.json
+
+# Secrets (FC_ACCESS_KEY, FC_ADMIN_PASSWORD) live in this file, chmod 600:
+EnvironmentFile=/home/afine/.config/mwatcher/fastcombo.env
+
+# Plex is the thing that transcodes; keep Fast Combo out of its way.
+Nice=10
+CPUWeight=50
+MemoryMax=1G
+
+[Install]
+WantedBy=multi-user.target

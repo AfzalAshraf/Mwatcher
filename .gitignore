@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+*.part
+*.part.*
+
+# Local media / staging — never commit video files
+media/
+staging/
+*.mkv
+*.mp4
+*.m4v
+*.avi
+*.webm
+*.strm
+
+# Secrets and local overrides
+.env
+*.local
+cloudflared/
+*.json.pem
+credentials*.json
