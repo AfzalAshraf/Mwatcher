@@ -1,0 +1,277 @@
+# Work log
+
+Engineering log for this branch: what was decided, what was verified, what
+broke and how. Written so the next session — or the next person — does not
+re-derive any of it.
+
+Session memory does not survive a sandbox recycle. This file is committed, so
+it does.
+
+---
+
+## 1. Where things stand
+
+| | |
+|---|---|
+| Branch | `arena/e20948b7-mwatcher` |
+| Pushed HEAD | `7daed62` — verify with `git ls-remote --heads origin arena/e20948b7-mwatcher` |
+| History | `32c014c` initial → `d46ab5a` bridge+installer → `caf563e` Seerr → `bceb51e` play-through → `7daed62` split topology |
+| Deploy target | **Lubuntu box** `afine@192.168.0.34` (Plex + library + bridge). Addons run on a **separate VPS** `ubuntu@stremio-vnic`. |
+
+The installer is the entry point: `sudo bash ~/Mwatcher/install.sh`.
+Subcommands: `status`, `doctor [title]`, `seerr`, `uninstall`, `--help`.
+
+### Sandbox quirks (why work keeps looking lost)
+
+These are environment artefacts, not code bugs. Confirm before "fixing" anything:
+
+- **Every process dies between turns.** All four demo services must be
+  restarted each session (recipe in §5). Probe first:
+  `(exec 3<>/dev/tcp/127.0.0.1/8889) 2>/dev/null && echo up`
+- **Local git rewinds to `32c014c`** while the working tree keeps the new
+  files. Recovery, never `git reset --hard`:
+  ```
+  git fetch -q origin arena/e20948b7-mwatcher && git reset --soft FETCH_HEAD
+  ```
+- `/home/user/sa-tmp`, `/tmp/*`, and site-packages are wiped on recycle
+  (PyYAML disappears; `pip install` needs `--break-system-packages`).
+- `nohup … &` hangs to the bash timeout — always use `start_process`.
+- Egress is allowlisted: `github.com` works, `raw.githubusercontent.com` and
+  `v3-cinemeta.strem.io` mostly do not. `ffprobe`/`ffmpeg` and `xxd` are
+  absent (use `od -An -tx1`), and there is no Docker.
+
+---
+
+## 2. Decision record
+
+Ruled out — do not re-propose:
+
+| Rejected | Why |
+|---|---|
+| Stremio-style addon install URL for Plex | Plex has no plugin framework since 2018; sources must be *files* |
+| Plex `.bundle` plugins | Dead framework |
+| Cloudflare **quick** tunnel for Plex | No stable hostname; breaks `*.plex.direct` certs |
+| Seerr as a downloader | Seerr only creates requests; Radarr/Sonarr fulfil them |
+| Hooking Stremio's Play button to fire a Seerr request | Not reachable from the client |
+| `.strm` as the main path | Was rejected, then **explicitly reversed by the user** — scrape-and-play-through is what was asked for |
+
+Standing constraints from the user:
+
+- One command, and it must **check what is already installed** rather than
+  blindly reinstall.
+- **Never regenerate an existing secret env file** — that would rotate
+  `FC_ACCESS_KEY`.
+- Commands must be **paste-safe**: no bare `install.sh` (auto-links), no `>`
+  redirects (arrive as `&gt;`). Prefer `sudo bash ~/Mwatcher/install.sh status`.
+- Seerr must remove the need for a debrid service.
+- Do **not** permanently download on the Stremio path — cache and play through.
+
+---
+
+## 3. Verified results
+
+Numbers actually measured, not asserted.
+
+### Play-through (`bceb51e`)
+
+| Check | Result |
+|---|---|
+| `.strm` size | **45 bytes** |
+| `Range: bytes=0-` on `/play/<key>.mkv` | `206`, `Content-Range: bytes 0-4194303/4194304`, `Accept-Ranges: bytes`, `X-Mwatcher-Stream: scraped live, candidate 2/3` |
+| Bytes returned | 4194304, magic `1a45dfa3` (Matroska — not HTML) |
+| Replay | cache hit, `cmp`-identical |
+| Seek `Range: bytes=2000000-2000999` | exactly 1000 bytes |
+| HTML-wall rejection | attempt 1 refused (`downloaded a web page, not a video (found '<!doctype html'`), attempt 2 succeeded |
+| `action=both` | Seerr `pending` **and** file downloaded |
+
+**The key fix:** play-through cannot validate after headers are sent — once
+`send_response` runs, failover is impossible and Plex will happily play HTML,
+which *is* error s1001. Read the first `CHUNK`, run `sniff_html()` plus a
+`Content-Type` check for `text/html`/`application/json`, and only then commit.
+`continue` inside `with upstream:` closes it cleanly.
+
+### Split topology (`7daed62`)
+
+| Check | Result |
+|---|---|
+| Remote unreachable | `status` → `· Fast Combo is remote: http://203.0.113.7:7000 (not a local port)`; `doctor` §1 prints the `ssh -N -L` fix |
+| Loopback URL | `FC_BASE_URL=http://127.0.0.1:7000` correctly still treated as **local** |
+| Unit rewrite | `Environment=FASTCOMBO_BASE_URL=` sed yields the remote URL when set, `http://127.0.0.1:7000` by default |
+| `fastcombo-tunnel.service` | `systemd-analyze verify` clean |
+
+### Gates run every change
+
+`bash -n install.sh` · `python3 -m py_compile scripts/*.py demo/*.py` ·
+`systemd-analyze verify` on each unit (a `.example` must be copied to a
+`.service` name first) · dashboard HTTP 200 · all 7 GET routes 200 ·
+bogus `/play/deadbeef00.mkv` → 404 · `status`/`doctor`/`--help` exit 0.
+
+---
+
+## 4. Traps that cost real time
+
+1. **`rm -rf /tmp/mwatcher-demo/{Movies,TV Shows,cache}/*` silently
+   under-deletes.** Brace expansion yields `…/TV Shows/*`, which word-splits
+   into `…/TV` and `Shows/*`. Quote paths with spaces separately, and verify
+   cleanups with mtimes: `find … -printf '%TH:%TM:%TS %p'`.
+   This caused a false alarm — two "duplicate" library files were stale
+   leftovers from before a restart, not a defect.
+2. **`curl -s $B/plays | …['plays'][0]` returns the NEWEST entry** (created
+   DESC), not the one just added. A test assuming otherwise mislabelled a
+   Breaking Bad play as Dune.
+3. **`DEMO_TRAP` did not fire** because its condition was
+   `not self.headers.get("Range")` — but Plex and curl send `Range: bytes=0-`.
+   A trap keyed on "no Range" cannot exercise any streaming path. Now it
+   whitelists only 1–3 byte probes. The trap must answer **200, not 403**, and
+   its ~150 B body needs `TELESTREAM_MIN_BYTES=100`.
+4. **A pre-existing output file masks the failover demo** — `run_job`
+   short-circuits on `os.path.exists(final_path)` → `skipped=True`. Same for a
+   cached play file making `/play` skip upstream. Clear before re-testing.
+5. **`log()` wrote to stdout**, corrupting CLI JSON. Now stderr.
+6. **`set -euo pipefail` + `find` inside `$( )`** dies silently on a missing
+   dir. Use `2>/dev/null | wc -l || echo 0`, `[ cond ] && cmd || true`,
+   `cmd || n=$?`, and end functions on a zero-status statement.
+7. **`sed '/PAT/,/^$/p'` on `--help` truncates misleadingly** — verify with `tail`.
+8. **systemd `Environment=` with an unquoted space** → `Invalid environment
+   assignment`. In the bridge unit, `EnvironmentFile=` (line 64) wins over
+   `Environment=` (line 54).
+9. **Seerr enums are not interchangeable.** RequestStatus: 1 pending,
+   2 approved, 3 declined, 4 processing, 5 failed. MediaStatus: 1 unknown,
+   2 pending, 3 processing, 4 partially available, 5 available.
+10. **An empty `find` result is not proof a file is missing** — the path or the
+    filesystem may be out of scope (`-xdev` skips other mounts).
+11. **Seerr keys requests by TMDB id, never IMDb**, and a 404 is ambiguous —
+    parse `{"errors":[{"message":…}]}`. `request()` must probe `media_status()`
+    first. The API key is an **admin credential**: chmod 600, never sent to the
+    browser, masked by `/config`.
+12. **Wrong-type metadata made a movie look like a series** — the fake addon now
+    mirrors Cinemeta's 404 on `/meta/series/<movie-id>`.
+
+---
+
+## 5. Demo restart recipe
+
+Four services. Fast Combo is the real upstream; the addon, Cinemeta and Seerr
+are local fakes. Start the two fakes first, then Fast Combo, then the bridge.
+
+```
+# deps (wiped on recycle)
+cd /home/user
+git clone --depth 1 https://github.com/AfzalAshraf/stremio-addons sa-tmp
+mkdir -p /tmp/mwatcher-demo/staging /tmp/mwatcher-demo/Movies "/tmp/mwatcher-demo/TV Shows" /tmp/mwatcher-demo/cache
+```
+
+All four via `start_process`, each with an `exec` prefix:
+
+| Name | cwd | Command |
+|---|---|---|
+| Fake addon + Cinemeta | `Mwatcher` | `DEMO_PORT=9912 DEMO_TRAP=4k exec python3 demo/fake_stremio_addon.py` |
+| Fake Seerr | `Mwatcher` | `SEERR_HOST=127.0.0.1 DEMO_PORT=5055 SEERR_API_KEY=testkey exec python3 demo/fake_seerr.py` |
+| Fast Combo (real) | `sa-tmp` | `PORT=7000 HOST=127.0.0.1 FC_ACCESS_KEY=testkey123456 FC_ADMIN_PASSWORD=testpass1234 FC_UPSTREAMS=http://127.0.0.1:9912/manifest.json FC_NO_STORAGE=1 FC_ADDON_NAME="Fast Combo (demo)" exec node server.js` |
+| Bridge + dashboard | `Mwatcher` | see below |
+
+Bridge env (one line, space-separated):
+
+```
+BRIDGE_HOST=0.0.0.0 BRIDGE_PORT=8889 FASTCOMBO_PREFER=best
+FASTCOMBO_BASE_URL=http://127.0.0.1:7000 FASTCOMBO_ACCESS_KEY=testkey123456
+CINEMETA_URL=http://127.0.0.1:9912
+TELESTREAM_STAGING=/tmp/mwatcher-demo/staging
+TELESTREAM_MOVIES_DIR=/tmp/mwatcher-demo/Movies
+TELESTREAM_TV_DIR='/tmp/mwatcher-demo/TV Shows'
+TELESTREAM_CACHE_DIR=/tmp/mwatcher-demo/cache TELESTREAM_CACHE_MAX_GB=50
+TELESTREAM_PUBLIC_BASE_URL=http://192.168.0.34:8889
+TELESTREAM_DOWNLOAD_CMD='curl -fsSL --retry 1 {headers} -o {out} {stream}'
+TELESTREAM_MIN_BYTES=100
+SEERR_URL=http://127.0.0.1:5055 SEERR_API_KEY=testkey SEERR_MODE=off
+```
+
+then `exec python3 scripts/telestream_to_plex.py serve`.
+
+**Bind to `0.0.0.0`** — the preview is proxied, and `127.0.0.1` gives a broken
+preview.
+
+### Seed the three modes
+
+```
+B=http://127.0.0.1:8889
+curl -s -X POST $B/add   -H 'Content-Type: application/json' -d '{"title":"Dune","year":2021,"imdb":"tt1160419"}'
+curl -s -X POST $B/fetch -H 'Content-Type: application/json' -d '{"title":"Breaking Bad","imdb":"tt0903747","kind":"show","episode":"S01E01","action":"strm"}'
+curl -s -X POST $B/fetch -H 'Content-Type: application/json' -d '{"title":"Interstellar","year":2014,"imdb":"tt0816692","action":"both"}'
+```
+
+Wait ~13 s for the download job, then confirm the pointer really streams:
+
+```
+curl -s -o /tmp/d.bin -w '%{http_code} %{size_download}\n' -H 'Range: bytes=0-' "$B/play/<key>.mkv"
+head -c 4 /tmp/d.bin | od -An -tx1     # want: 1a45dfa3
+```
+
+Expected library: Interstellar `.mkv` at 4194304 B, Dune `.strm` at 45 B,
+Breaking Bad `.strm` at 45 B under `TV Shows/Breaking Bad/Season 01/`.
+
+---
+
+## 6. Open items
+
+- [ ] `TELESTREAM_PUBLIC_BASE_URL` must be reachable from Plex **clients**;
+      loopback ⇒ s1001 on every device but the server itself.
+- [ ] Play-through puts an **unauthenticated** media endpoint (`/play/<key>`) in
+      the playback path. Remote clients need Tailscale or an authed reverse
+      proxy — not a bare public `:8889`.
+- [ ] The VPS side of layout B needs `ssh-copy-id` before
+      `fastcombo-tunnel.service` can start unattended.
+- [ ] Seerr is only ever tested against `demo/fake_seerr.py`; the compose stack
+      is YAML-validated only (no Docker in the sandbox).
+- [ ] `TELESTREAM_CACHE_MAX_GB` default is 20 in code; the demo runs 50.
+      Undecided whether 50 should become the shipped default.
+
+---
+
+## 7. Reference material condensed here
+
+Full detail lives in `docs/PLEX_GLOBAL_ACCESS.md`; these are the load-bearing facts.
+
+**Plex s1001 (network error).** Top cause per the accepted forum answer: server
+log `MDE: video has neither a video stream nor an audio stream` → the file is
+not a video file. Verify in VLC / force **Analyze** / check Media Info. Also: a
+dead **Settings → Extras → Movie pre-roll video** URL breaks *every* title;
+corrupt DB (delete `com.plexapp.plugins.library.db-shm`/`-wal`, restart,
+`VACUUM;`, or PlexDBRepair); `secureConnections="2"` with a non-`*.plex.direct`
+cert; a custom URL containing `127.0.0.1`; the ~2 Mbps Relay cap; CGNAT
+(`100.64.0.0/10`); the `plex` user unable to read the file; rclone-mount I/O
+errors.
+
+**Seerr.** Auth header `X-Api-Key`; key from Settings → General. Base
+`/api/v1`, port 5055, image `fallenbagel/seerr:latest`, health
+`/api/v1/settings/about`. `POST /api/v1/request` with
+`{"mediaType":"movie","mediaId":<TMDB>}`; TV all seasons adds
+`"seasons":"all"`, specific ones `"seasons":[1,3]`. Optional pass-throughs:
+`is4k`, `serverId`, `profileId`, `rootFolder`, `tags`, `languageProfileId`,
+`userId`. `GET /api/v1/search?query=` returns `{page,results,totalCount}` with
+`mediaType`, `id` (TMDB), `title`/`name`, `releaseDate`/`firstAirDate`,
+`mediaInfo.status`. Reference compose ports: radarr 7878, sonarr 8989,
+prowlarr 9696, qbittorrent 8080 (+6881 tcp/udp), bazarr 6767. Wiring order:
+qBittorrent (change `admin/adminadmin`) → Prowlarr → link Prowlarr to
+Radarr/Sonarr → Download Clients (host = docker service name, category
+`sonarr`/`radarr`).
+
+**Fast Combo** (`github.com/AfzalAshraf/stremio-addons`, v2.1.0). Per request:
+parallel ask → drop CAM/TS/REMUX/download-only/ads/error cards → dedupe fastest
+→ hide wrong episodes → live-probe → hide soon-expiring → sort tested-working
+then best-picture-per-byte. **Each install generates its own `FC_ACCESS_KEY`
+and `FC_ADMIN_PASSWORD`.** Stremio needs https for non-local addons; set
+`FC_PUBLIC_URL` behind a proxy. `/api/*` is admin-gated, so the bridge uses
+`/{key}/stream/...`. Silently dropping large files is *by design*
+(`filterReason()` bitrate caps). Env: `FC_SECRET`, `FC_MAX_ADDONS` (50/15),
+`FC_UPSTREAMS`, `FC_ADDON_NAME`, `FC_FRESH_SECONDS` 120, `FC_CACHE_MINUTES` 15,
+`FC_NEW_HOURS` 24, `FC_MAX_PROBES`/`FC_PROBE_CONCURRENCY`/`FC_PROBE_TIMEOUT_MS`,
+`FC_AI_CATALOG`, `FC_LLM_*`, `FC_DATA_FILE`/`FC_NO_STORAGE=1`, `FC_PRIVATE_HOST`.
+
+**Plex install/networking.** apt repo `https://repo.plex.tv/deb/ public main`,
+key `https://downloads.plex.tv/plex-keys/PlexSign.v2.key` →
+`/etc/apt/keyrings/plexmediaserver.v2.gpg` with `signed-by=`. Remote access
+needs one inbound TCP path to internal **32400** ("Manually specify public
+port"). Plex-over-cloudflared: named tunnel, `originServerName: "*.plex.direct"`,
+`noTLSVerify: true`, LAN-first custom URLs, WebSockets on, caching/Rocket
+Loader off. Tailscale for CGNAT: `serve --bg --https=443` + `funnel --bg 443 on`.

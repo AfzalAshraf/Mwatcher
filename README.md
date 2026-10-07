@@ -29,9 +29,11 @@ your Stremio addons ──▶ Fast Combo ──▶ Mwatcher bridge ──▶ sta
 | `scripts/seerr_source.py` | Seerr client: search → TMDB id → create a request, plus `--doctor` for the request path |
 | `services/seerr-stack/docker-compose.yml` | Seerr + Radarr + Sonarr + Prowlarr + qBittorrent, all sharing one media path |
 | `services/fastcombo.service` | Runs your addons (Fast Combo) on `127.0.0.1:7000` |
+| `services/fastcombo-tunnel.service.example` | Keeps an SSH tunnel to a **remote** Fast Combo alive, so the access key never crosses a public interface |
 | `services/mwatcher-bridge.service` | Runs the bridge on `127.0.0.1:8889` |
 | `config/*.env.example` | Secret files for the two services (access key, admin password) |
 | `demo/fake_stremio_addon.py` | A pretend addon **and** pretend Cinemeta, so you can test the whole pipeline offline |
+| `docs/WORKLOG.md` | Engineering log: decisions taken and why, measured results, the traps that cost time, and the exact demo restart recipe |
 | `demo/fake_seerr.py` | A pretend Seerr (same API, same auth errors), so the request path is testable with no Docker |
 
 ## Quick start — one command
