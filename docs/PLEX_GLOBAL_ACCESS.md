@@ -184,13 +184,54 @@ sudo FC_BASE_URL=http://127.0.0.1:7000 FC_REMOTE_ACCESS_KEY=<your-key> bash inst
 Keep it up across reboots with `services/fastcombo-tunnel.service.example` (needs
 passwordless key auth, since a systemd service cannot answer a password prompt).
 
+**C. Everything on the server your addons already run on.** Layout A, but on the VPS rather
+than a home machine — Plex, the library, the bridge *and* Fast Combo all on one box. Nothing
+to tunnel, nothing exposed except Plex itself:
+
+```bash
+# on the VPS
+sudo bash install.sh
+```
+
+**The installer detects the Fast Combo that is already there and adopts it.** This matters
+more than it sounds. Reinstalling blindly on a machine whose addons already work is
+destructive in two specific ways: a second clone in `~/stremio-addons` gets a freshly
+generated `FC_ACCESS_KEY`, so the addon URL saved in your Stremio app stops resolving; and
+rewriting `/etc/systemd/system/fastcombo.service` repoints the *running* service at that new,
+unconfigured clone. So the installer instead:
+
+- finds the unit that already runs a stremio-addons `server.js` — under any name — and reads
+  its `WorkingDirectory`, so it uses your real clone directory rather than assuming
+  `~/stremio-addons`;
+- falls back to looking for a clone in `~/fastcombo`, `/opt/stremio-addons`,
+  `/srv/stremio-addons`;
+- takes the existing `FC_ACCESS_KEY` and `FC_ADMIN_PASSWORD` from your config, the unit's
+  `EnvironmentFile`, or the clone's `.env`, and reuses them — it does **not** rotate them;
+- installs only `mwatcher-bridge.service` and leaves your Fast Combo unit completely alone;
+- says so out loud: `adopting it, not reinstalling`, `access key: reused (N chars)`.
+
+If it cannot find the key, pass it in rather than letting a new one be generated:
+
+```bash
+sudo FC_ACCESS_KEY=<the-key-your-addons-already-use> bash install.sh
+```
+
+That key is the secret part of your Stremio addon link — everything between the domain and
+`/manifest.json`. `status` reports an adopted install and its key too, so you can check
+before committing to anything.
+
+On a VPS, note what layout C costs you: media lives on rented disk, so the play-through cache
+(§4.6) is worth using instead of downloads; there is usually no GPU, so Plex transcodes on
+CPU; and Plex remote access means opening TCP 32400 (§5b) or using Tailscale (§5d).
+
 Whichever you choose, **the bridge, Plex and the library must be on the same machine.** That
 is not a preference: the bridge writes files Plex has to read, staging must be on the same
 filesystem as the library for the atomic move to work, and in play-through mode (§4.6) your
 Plex clients stream *through the bridge* — so they have to be able to reach it.
 
-`sudo bash install.sh status` and `doctor` both understand layout B: they probe the remote
-URL instead of a local port, and doctor tells you if this machine cannot reach it.
+`sudo bash install.sh status` and `doctor` both understand layouts B and C: they probe the
+remote URL instead of a local port in B, and in C they report the Fast Combo unit that is
+already running rather than assuming it is called `fastcombo`.
 
 ### 4.1 Run Fast Combo (your addons, merged and ranked)
 

@@ -55,6 +55,9 @@ BRIDGE_PORT="${BRIDGE_PORT:-8889}"
 # Reaching a VPS over the public internet exposes your addon key. The safer route is an
 # SSH tunnel, which makes the remote look local -- the installer prints that recipe.
 FC_BASE_URL="${FC_BASE_URL:-}"
+# The key of a Fast Combo that is ALREADY installed here (see fc_detect_existing below).
+# Only needed when the installer cannot find it on its own.
+FC_ACCESS_KEY="${FC_ACCESS_KEY:-}"
 if [ -z "$FC_BASE_URL" ] && [ -f "$RUN_HOME/.config/mwatcher/bridge.env" ]; then
   FC_BASE_URL="$(grep -E '^FASTCOMBO_BASE_URL=' "$RUN_HOME/.config/mwatcher/bridge.env" 2>/dev/null | head -1 | cut -d= -f2- || true)"
 fi
@@ -69,6 +72,91 @@ fc_is_remote() {
 
 fc_target() {
   if fc_is_remote; then printf '%s' "$FC_BASE_URL"; else printf 'http://127.0.0.1:%s' "$FC_PORT"; fi
+}
+
+# Fast Combo may ALREADY be installed on this machine. That is the normal case on the box
+# where your addons have been running all along -- a VPS set up with stremio-addons' own
+# installer, say. Reinstalling blindly would be actively destructive there:
+#
+#   * a second clone in ~/stremio-addons gets a freshly generated FC_ACCESS_KEY, and the
+#     addon URL already saved in your Stremio app stops resolving;
+#   * rewriting /etc/systemd/system/fastcombo.service repoints the running service at that
+#     new clone and new key, so your working install is replaced by an unconfigured one.
+#
+# So find what is already here, adopt it, and only install our own when nothing is.
+FC_UNIT=""            # systemd unit that already runs Fast Combo on this box
+FC_ADOPTED=""         # non-empty once we are reusing an existing install
+FC_EXISTING_KEY=""    # the access key that install already uses
+FC_EXISTING_ADMIN=""  # and its admin password
+
+fc_unit_dir() {
+  local u="$1" d="" p=""
+  [ -n "$u" ] || return 1
+  d="$(systemctl cat "$u" 2>/dev/null | grep -E '^WorkingDirectory=' | head -1 | cut -d= -f2- || true)"
+  if [ -n "$d" ] && [ -d "$d" ]; then printf '%s' "$d"; return 0; fi
+  p="$(systemctl cat "$u" 2>/dev/null | grep -oE '/[^ "'"'"']*/server\.js' | head -1 || true)"
+  if [ -n "$p" ]; then dirname "$p"; return 0; fi
+  return 1
+}
+
+fc_unit_envfile() {
+  local u="$1"
+  [ -n "$u" ] || return 1
+  systemctl cat "$u" 2>/dev/null | grep -E '^EnvironmentFile=' | head -1 | sed -E 's/^EnvironmentFile=-?//' || true
+}
+
+# Read one VAR=value out of an env file. Prints nothing (and stays exit 0) when absent.
+fc_var_from() {
+  local f="$1" v="$2"
+  [ -n "$f" ] && [ -f "$f" ] || return 1
+  grep -E "^$v=" "$f" 2>/dev/null | head -1 | cut -d= -f2- || true
+}
+
+fc_detect_existing() {
+  FC_ADOPTED=""; FC_UNIT=""; FC_EXISTING_KEY=""; FC_EXISTING_ADMIN=""
+  # Addons served from another machine: there is nothing local to adopt, and probing this
+  # box's units would only produce a misleading "already installed".
+  fc_is_remote && return 0
+
+  local f u d k
+  # 1. any unit that runs a stremio-addons / fastcombo server.js -- ours, or theirs
+  for f in /etc/systemd/system/*.service /lib/systemd/system/*.service; do
+    [ -f "$f" ] || continue
+    grep -qE '^(ExecStart|WorkingDirectory)=.*(stremio-addons|fastcombo)' "$f" 2>/dev/null || continue
+    u="${f##*/}"; FC_UNIT="$u"; break
+  done
+
+  # 2. run Fast Combo from wherever that unit actually runs it, not from our default path
+  if [ -n "$FC_UNIT" ]; then
+    d="$(fc_unit_dir "$FC_UNIT" || true)"
+    if [ -n "$d" ] && [ -d "$d" ]; then FC_DIR="$d"; fi
+  fi
+
+  # 3. no unit, but a clone sitting in an obvious place
+  if [ ! -f "$FC_DIR/server.js" ]; then
+    for d in "$RUN_HOME/stremio-addons" "$RUN_HOME/fastcombo" "$RUN_HOME/stremio-fastcombo" \
+             /opt/stremio-addons /srv/stremio-addons; do
+      if [ -f "$d/server.js" ] || [ -d "$d/.git" ]; then FC_DIR="$d"; break; fi
+    done
+  fi
+
+  # 4. the credentials that install already uses -- ours, the unit's, or the clone's .env
+  for f in "$CONFIG_DIR/fastcombo.env" "$(fc_unit_envfile "$FC_UNIT" 2>/dev/null || true)" \
+           "$FC_DIR/.env" "$RUN_HOME/.config/fastcombo.env" "$RUN_HOME/.config/fastcombo/fastcombo.env"; do
+    if [ -z "$FC_EXISTING_KEY" ]; then
+      k="$(fc_var_from "$f" 'FC_ACCESS_KEY' 2>/dev/null || true)"
+      [ -z "$k" ] && k="$(fc_var_from "$f" 'FASTCOMBO_ACCESS_KEY' 2>/dev/null || true)"
+      [ -n "$k" ] && FC_EXISTING_KEY="$k"
+    fi
+    if [ -z "$FC_EXISTING_ADMIN" ]; then
+      k="$(fc_var_from "$f" 'FC_ADMIN_PASSWORD' 2>/dev/null || true)"
+      [ -n "$k" ] && FC_EXISTING_ADMIN="$k"
+    fi
+  done
+
+  # 5. adopt when there is a unit or a real clone to adopt
+  if [ -n "$FC_UNIT" ] || [ -f "$FC_DIR/server.js" ]; then FC_ADOPTED="yes"; fi
+  return 0
 }
 
 # --------------------------------------------------------------- pretty print
@@ -94,6 +182,8 @@ have() { command -v "$1" >/dev/null 2>&1; }
 port_open() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null && { exec 3>&- 3<&-; return 0; } || return 1; }
 svc_active() { systemctl is-active --quiet "$1" 2>/dev/null; }
 
+fc_detect_existing
+
 # =============================================================================
 #  status
 # =============================================================================
@@ -101,7 +191,9 @@ do_status() {
   hdr "Mwatcher status  (user: $RUN_USER)"
 
   printf '\n%sServices%s\n' "$B" "$R"
-  for s in plexmediaserver fastcombo mwatcher-bridge; do
+  local svc_list="plexmediaserver ${FC_UNIT:-fastcombo} mwatcher-bridge"
+  fc_is_remote && svc_list="plexmediaserver mwatcher-bridge"
+  for s in $svc_list; do
     if svc_active "$s"; then
       ok "$s  $(systemctl show -p ActiveEnterTimestamp --value "$s" 2>/dev/null | sed 's/^/since /')"
     elif systemctl list-unit-files 2>/dev/null | grep -q "^$s.service"; then
@@ -123,6 +215,7 @@ do_status() {
   printf '\n%sPaths%s\n' "$B" "$R"
   [ -n "$REPO_DIR" ] && ok "repo:      $REPO_DIR" || warn "repo:      not found"
   [ -d "$FC_DIR" ]   && ok "Fast Combo: $FC_DIR"  || warn "Fast Combo: $FC_DIR missing"
+  [ -n "$FC_ADOPTED" ] && info "             pre-existing install, adopted — unit ${FC_UNIT:-not found}, left as it is"
   for d in "$MEDIA_DIR/Movies" "$MEDIA_DIR/TV Shows" "$MEDIA_DIR/staging"; do
     [ -d "$d" ] && ok "library:   $d" || warn "library:   $d missing"
   done
@@ -166,6 +259,11 @@ do_status() {
       bad "Fast Combo at $fcbase did not answer with that key
        (unreachable, wrong key, or it needs https from this network)"
     fi
+  elif [ -n "$FC_EXISTING_KEY" ]; then
+    # The key exists, just not in a file we own yet -- installing would reuse it.
+    warn "no access key in $CONFIG_DIR/bridge.env or $CONFIG_DIR/fastcombo.env"
+    ok "but the Fast Combo already installed here uses one (${#FC_EXISTING_KEY} chars)"
+    info "'sudo bash install.sh' reuses that key instead of generating a new one"
   else
     bad "no access key in $CONFIG_DIR/bridge.env or $CONFIG_DIR/fastcombo.env"
   fi
@@ -249,7 +347,7 @@ do_doctor() {
 
   # ---- 1. services & ports --------------------------------------------------
   hdr "1. Services"
-  local svc_list="plexmediaserver fastcombo mwatcher-bridge"
+  local svc_list="plexmediaserver ${FC_UNIT:-fastcombo} mwatcher-bridge"
   fc_is_remote && svc_list="plexmediaserver mwatcher-bridge"
   for s in $svc_list; do
     svc_active "$s" && ok "$s running" || { bad "$s NOT running"; problems=$((problems+1)); }
@@ -645,6 +743,23 @@ do_install() {
        Add the secret part of your addon link to $CONFIG_DIR/bridge.env:
             FASTCOMBO_ACCESS_KEY=<the key from your VPS Fast Combo>"
     fi
+  elif [ -n "$FC_ADOPTED" ]; then
+    ok "Fast Combo is ALREADY installed here — adopting it, not reinstalling"
+    [ -n "$FC_UNIT" ] && info "running as:  $FC_UNIT  (left exactly as it is)"
+    info "directory:   $FC_DIR"
+    if [ -n "$FC_EXISTING_KEY" ]; then
+      info "access key:  reused (${#FC_EXISTING_KEY} chars) — your Stremio addon URL keeps working"
+    else
+      warn "could not find the access key that install uses, so the bridge has none yet.
+       It is the secret part of your addon link (between the domain and /manifest.json):
+            sudo FC_ACCESS_KEY=<key> bash install.sh"
+    fi
+    if port_open "$FC_PORT"; then
+      ok "answering on 127.0.0.1:$FC_PORT right now"
+    else
+      warn "nothing is listening on $FC_PORT yet — start it with:
+            sudo systemctl start ${FC_UNIT:-fastcombo}"
+    fi
   elif [ -d "$FC_DIR/.git" ]; then
     ok "already cloned: $FC_DIR  (update with: cd $FC_DIR && git pull)"
   else
@@ -654,8 +769,25 @@ do_install() {
   fi
 
   as_user "mkdir -p '$CONFIG_DIR' '$RUN_HOME/.local/share/fastcombo'"
+  local reuse=""
+  [ -n "$FC_ACCESS_KEY" ] && reuse="$FC_ACCESS_KEY"
+  [ -z "$reuse" ] && [ -n "$FC_EXISTING_KEY" ] && reuse="$FC_EXISTING_KEY"
+
   if [ -f "$CONFIG_DIR/fastcombo.env" ]; then
     ok "keeping your existing $CONFIG_DIR/fastcombo.env (access key unchanged)"
+  elif [ -n "$reuse" ]; then
+    # An install already answers with this key. Generating a fresh one here would leave the
+    # bridge holding a key Fast Combo has never heard of -- every lookup 404s.
+    local p="$FC_EXISTING_ADMIN"
+    [ -n "$p" ] || p="$(gen_key 12)"
+    cat > "$CONFIG_DIR/fastcombo.env" <<EOF
+FC_ACCESS_KEY=$reuse
+FC_ADMIN_PASSWORD=$p
+EOF
+    chown "$RUN_USER:$RUN_USER" "$CONFIG_DIR/fastcombo.env"
+    chmod 600 "$CONFIG_DIR/fastcombo.env"
+    ok "created $CONFIG_DIR/fastcombo.env reusing the key this install already uses (mode 600)"
+    [ -n "$FC_ADOPTED" ] && info "your existing Fast Combo and its addon list are untouched"
   else
     local k p
     k="$(gen_key 16)"; p="$(gen_key 12)"
@@ -681,6 +813,8 @@ EOF
     fi
   else
     fckey="$(grep -E '^FC_ACCESS_KEY=' "$CONFIG_DIR/fastcombo.env" 2>/dev/null | head -1 | cut -d= -f2- || true)"
+    # Adopting an install whose key lives somewhere we do not write to.
+    [ -z "$fckey" ] && fckey="${FC_ACCESS_KEY:-$FC_EXISTING_KEY}"
   fi
   if [ -f "$CONFIG_DIR/bridge.env" ]; then
     ok "keeping your existing $CONFIG_DIR/bridge.env"
@@ -710,6 +844,11 @@ EOF
   if fc_is_remote; then
     units="mwatcher-bridge"
     info "not installing fastcombo.service — addons are served from $FC_BASE_URL"
+  elif [ -n "$FC_ADOPTED" ]; then
+    # Overwriting this unit would repoint a working service at a clone it was not
+    # configured for. The existing install keeps running under its own unit.
+    units="mwatcher-bridge"
+    info "not touching ${FC_UNIT:-fastcombo.service} — your existing Fast Combo keeps running as it is"
   fi
   for unit in $units; do
     local src="$REPO_DIR/services/$unit.service" dst="/etc/systemd/system/$unit.service"
@@ -958,6 +1097,12 @@ Mwatcher installer
   sudo bash install.sh uninstall          remove the services (keeps media)
 
 Safe to re-run: existing keys, passwords and addon lists are preserved.
+
+Everything on one machine -- including the box your addons already run on:
+  sudo bash install.sh
+  An existing Fast Combo is detected and adopted: no second clone, no new access key,
+  and its systemd unit is left alone, so the addon URL in your Stremio app keeps working.
+  If the key cannot be found automatically:  sudo FC_ACCESS_KEY=<key> bash install.sh
 
 Addons on another machine (e.g. a VPS), Plex here:
   sudo FC_BASE_URL=https://addons.example.com FC_REMOTE_ACCESS_KEY=<key> bash install.sh

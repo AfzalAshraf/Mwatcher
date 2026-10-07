@@ -99,6 +99,30 @@ which *is* error s1001. Read the first `CHUNK`, run `sniff_html()` plus a
 | Unit rewrite | `Environment=FASTCOMBO_BASE_URL=` sed yields the remote URL when set, `http://127.0.0.1:7000` by default |
 | `fastcombo-tunnel.service` | `systemd-analyze verify` clean |
 
+### Adopting an existing Fast Combo (layout C — all on the VPS)
+
+Reinstalling on a box whose addons already work is destructive: a second clone gets a fresh
+`FC_ACCESS_KEY`, breaking the addon URL saved in Stremio, and rewriting `fastcombo.service`
+repoints the *running* service at that unconfigured clone. `fc_detect_existing` prevents it.
+Verified by sourcing the script's functions and running seven fixtures:
+
+| Fixture | Result |
+|---|---|
+| Nothing installed | no adoption, clones as before |
+| Clone at `~/stremio-addons` + `.env` | adopted; key **and** admin password recovered |
+| Clone at `~/fastcombo` instead | adopted, `FC_DIR` repointed to the real directory |
+| Our `fastcombo.env` already present | ours wins over the clone's `.env` |
+| `FC_ACCESS_KEY=<key>` given | override wins over everything detected |
+| `FC_BASE_URL=https://…` (remote) | never adopts — layout B unaffected |
+| `FC_BASE_URL=http://127.0.0.1:7000` | loopback = local, so adoption still applies |
+
+Detection order: any unit whose `ExecStart`/`WorkingDirectory` mentions `stremio-addons` or
+`fastcombo` (read via `systemctl cat`, so the unit need not be named `fastcombo`) → its
+`WorkingDirectory` → else `~/stremio-addons`, `~/fastcombo`, `~/stremio-fastcombo`,
+`/opt/stremio-addons`, `/srv/stremio-addons`. Credentials from our env file, the unit's
+`EnvironmentFile`, the clone's `.env`, `~/.config/fastcombo.env`. When adopting, only
+`mwatcher-bridge.service` is installed and the existing unit is never written.
+
 ### Gates run every change
 
 `bash -n install.sh` · `python3 -m py_compile scripts/*.py demo/*.py` ·
@@ -146,6 +170,11 @@ bogus `/play/deadbeef00.mkv` → 404 · `status`/`doctor`/`--help` exit 0.
     browser, masked by `/config`.
 12. **Wrong-type metadata made a movie look like a series** — the fake addon now
     mirrors Cinemeta's 404 on `/meta/series/<movie-id>`.
+13. **An installer that "repairs" can destroy a working install.** On the box where Fast
+    Combo already runs, generating a new key and rewriting the unit breaks the addon URL in
+    the user's Stremio app and repoints the live service at an unconfigured clone. "Safe to
+    re-run" has to mean *adopt what is there*, not just *don't overwrite the env file*. See
+    §3 for the detection order.
 
 ---
 
