@@ -898,10 +898,25 @@ EOF
   if [ -f "$CONFIG_DIR/bridge.env" ]; then
     ok "keeping your existing $CONFIG_DIR/bridge.env"
     local bk; bk="$(grep -E '^FASTCOMBO_ACCESS_KEY=' "$CONFIG_DIR/bridge.env" | head -1 | cut -d= -f2- || true)"
-    if [ "$bk" != "$fckey" ]; then
-      warn "bridge.env key does not match fastcombo.env — fixing it"
+    if [ -z "$bk" ]; then
+      # A hand-made or half-finished file has no key line at all, and `sed s|^KEY=.*|...|`
+      # matches nothing -- so it would change nothing and then report "keys now match".
+      if [ -n "$fckey" ]; then
+        printf 'FASTCOMBO_ACCESS_KEY=%s\n' "$fckey" >> "$CONFIG_DIR/bridge.env"
+        ok "added the missing FASTCOMBO_ACCESS_KEY"
+      else
+        warn "bridge.env has no FASTCOMBO_ACCESS_KEY and none could be determined"
+      fi
+    elif [ -n "$fckey" ] && [ "$bk" != "$fckey" ]; then
+      warn "bridge.env key does not match the one Fast Combo actually uses — fixing it"
       sed -i "s|^FASTCOMBO_ACCESS_KEY=.*|FASTCOMBO_ACCESS_KEY=$fckey|" "$CONFIG_DIR/bridge.env"
       ok "keys now match"
+    fi
+    local bm; bm="$(stat -c '%a' "$CONFIG_DIR/bridge.env" 2>/dev/null || echo '')"
+    if [ -n "$bm" ] && [ "$bm" != "600" ]; then
+      chmod 600 "$CONFIG_DIR/bridge.env"
+      chown "$RUN_USER:$RUN_USER" "$CONFIG_DIR/bridge.env" 2>/dev/null || true
+      ok "tightened bridge.env from mode $bm to 600 — it holds your access key"
     fi
   else
     {

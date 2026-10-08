@@ -98,6 +98,9 @@ which *is* error s1001. Read the first `CHUNK`, run `sniff_html()` plus a
 | Loopback URL | `FC_BASE_URL=http://127.0.0.1:7000` correctly still treated as **local** |
 | Unit rewrite | `Environment=FASTCOMBO_BASE_URL=` sed yields the remote URL when set, `http://127.0.0.1:7000` by default |
 | `fastcombo-tunnel.service` | `systemd-analyze verify` clean |
+| `gen_key` under `set -Eeuo pipefail` | 16/12/24 chars, no SIGPIPE, no silent exit |
+| `ERR` trap | fires on an injected failure naming line + command; silent on success |
+| `bridge.env` repair | key appended when absent · corrected when wrong · no-op on re-run · 664 → 600 |
 
 ### Adopting an existing Fast Combo (layout C — all on the VPS)
 
@@ -217,7 +220,14 @@ bogus `/play/deadbeef00.mkv` → 404 · `status`/`doctor`/`--help` exit 0.
     that is present — and the bridge, started by systemd, would not find it either. `PATH`
     now gains `$RUN_HOME/.local/bin` right after `RUN_HOME` is resolved, which fixes both the
     report and the service.
-17. **Test fixtures that share a scratch directory must not clean each other's.** Two
+17. **`sed 's|^KEY=.*|value|'` silently does nothing when the line is absent** — and the
+    installer then printed "keys now match". A hand-made `bridge.env` (created with `nano`
+    after a failed run) has no `FASTCOMBO_ACCESS_KEY` line at all, so the "fix" was a no-op
+    that claimed success. Now: append when absent, substitute when wrong, warn when no key
+    can be determined, and tighten the file to mode 600 — `nano` leaves 664, which leaks an
+    access key to every local user. Verified on all four paths, including that a re-run
+    changes nothing.
+18. **Test fixtures that share a scratch directory must not clean each other's.** Two
     regression scripts both used `/tmp/fc`; the second deleted it on entry, so the first
     "failed" when run afterwards. Ordering artefacts look exactly like regressions — run each
     suite in isolation before believing a failure.
