@@ -116,12 +116,33 @@ Verified by sourcing the script's functions and running seven fixtures:
 | `FC_BASE_URL=https://…` (remote) | never adopts — layout B unaffected |
 | `FC_BASE_URL=http://127.0.0.1:7000` | loopback = local, so adoption still applies |
 
-Detection order: any unit whose `ExecStart`/`WorkingDirectory` mentions `stremio-addons` or
-`fastcombo` (read via `systemctl cat`, so the unit need not be named `fastcombo`) → its
-`WorkingDirectory` → else `~/stremio-addons`, `~/fastcombo`, `~/stremio-fastcombo`,
-`/opt/stremio-addons`, `/srv/stremio-addons`. Credentials from our env file, the unit's
-`EnvironmentFile`, the clone's `.env`, `~/.config/fastcombo.env`. When adopting, only
+Detection asks systemd rather than guessing paths: `fc_find_unit` confirms the conventional
+names through `systemctl show -p FragmentPath`, then falls back to scanning
+`/etc/systemd/system`, `*.target.wants`, `/usr/lib/systemd/system` and `/lib/systemd/system`
+for a unit pointing at a stremio-addons or fastcombo tree. `fc_unit_dir` reads
+`WorkingDirectory`, then the `.js` path out of `ExecStart`. Credentials come from our env
+file, the clone's `.env`, then the unit's `EnvironmentFiles` — **before** its inline
+`Environment=`, because systemd lets `EnvironmentFile=` override `Environment=`, so the
+inline value is usually the stale one. `fc_is_clone` accepts `server.js`, `index.js`,
+`app.js`, `src/server.js` or `src/index.js`; requiring `server.js` alone is what made the
+first version miss a live install and offer to re-clone over it. When adopting, only
 `mwatcher-bridge.service` is installed and the existing unit is never written.
+
+**Field report — `afine@adblock`, Ubuntu 26.04.1, the run that found three bugs.** Plex
+1.43.4 already installed and running, `fastcombo` service up since Oct 3, `~/stremio-addons`
+already cloned. The install printed sections 1–4 and then **stopped with no message at all**,
+leaving no `fastcombo.env`, no `bridge.env`, no `mwatcher-bridge.service`:
+
+```
+4. Fast Combo (your Stremio addons)
+  ✓ already cloned: /home/afine/stremio-addons
+afine@adblock:~$            <- script gone, exit status swallowed
+```
+
+Cause was `gen_key` (trap 14). It also showed the first adoption pass failing to recognise a
+machine that plainly had a working Fast Combo, and `yt-dlp` reporting failure immediately
+after installing successfully (trap 16). All three are fixed; the ERR trap (trap 15) means a
+fourth would at least announce itself.
 
 ### Gates run every change
 
@@ -175,6 +196,31 @@ bogus `/play/deadbeef00.mkv` → 404 · `status`/`doctor`/`--help` exit 0.
     the user's Stremio app and repoints the live service at an unconfigured clone. "Safe to
     re-run" has to mean *adopt what is there*, not just *don't overwrite the env file*. See
     §3 for the detection order.
+14. **`gen_key` killed the installer silently on a real machine.** It was
+    `tr -dc 'A-Za-z0-9' </dev/urandom | head -c "$n"`. `head` closes the pipe early, `tr`
+    takes SIGPIPE and exits **141**, `pipefail` makes that the pipeline's status, and
+    `set -e` then aborts on `k="$(gen_key 16)"` — a failing command substitution inside an
+    assignment *does* trigger `set -e`. No output, no exit message, install stops mid-way.
+    Reproduced: `bash gk.sh` prints "before" and never "after", exit 141. Fixed by reading a
+    bounded chunk (`head -c 512 /dev/urandom | tr -dc …`) in a loop, so nothing is ever
+    interrupted. **Never pipe an endless source into `head` under `pipefail`.**
+15. **`set -e` exits without saying anything.** A half-finished install with no error is far
+    worse than an error, because the user cannot tell what is missing. `install.sh` now runs
+    `set -Eeuo pipefail` with an `ERR` trap printing `install.sh:<line> failed (exit N)`, the
+    failing `$BASH_COMMAND`, and a note that the install is incomplete and safe to re-run.
+    `-E` (errtrace) is required or the trap is not inherited by functions. Watch the quoting:
+    the trap body must be single-quoted so `$LINENO`/`$?`/`$BASH_COMMAND` expand when it
+    *fires*, and the inner `printf` format must therefore be double-quoted — nesting single
+    quotes inside is a syntax error that `bash -n` catches.
+16. **`~/.local/bin` is not in sudo's `secure_path`.** `pip install --user yt-dlp` succeeds,
+    then `have yt-dlp` fails and the installer reports "yt-dlp install failed" for a tool
+    that is present — and the bridge, started by systemd, would not find it either. `PATH`
+    now gains `$RUN_HOME/.local/bin` right after `RUN_HOME` is resolved, which fixes both the
+    report and the service.
+17. **Test fixtures that share a scratch directory must not clean each other's.** Two
+    regression scripts both used `/tmp/fc`; the second deleted it on entry, so the first
+    "failed" when run afterwards. Ordering artefacts look exactly like regressions — run each
+    suite in isolation before believing a failure.
 
 ---
 

@@ -14,7 +14,7 @@
 #
 #  Ubuntu 20.04+ / Debian 11+ / Lubuntu. Needs sudo.
 # =============================================================================
-set -euo pipefail
+set -Eeuo pipefail   # -E so the ERR trap below is inherited by functions
 
 # --------------------------------------------------------------- who / where
 if [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER}" != "root" ]; then
@@ -34,6 +34,14 @@ elif [ -f "$RUN_HOME/Mwatcher/scripts/telestream_to_plex.py" ]; then
 else
   REPO_DIR=""
 fi
+
+# pip --user and pipx install into ~/.local/bin, which sudo's secure_path does not include.
+# Without this a perfectly good yt-dlp looks missing and the installer reports a failure
+# that did not happen -- and systemd would not find it for the bridge either.
+case ":$PATH:" in
+  *":$RUN_HOME/.local/bin:"*) ;;
+  *) PATH="$RUN_HOME/.local/bin:$PATH"; export PATH ;;
+esac
 
 FC_DIR="${FC_DIR:-$RUN_HOME/stremio-addons}"
 CONFIG_DIR="$RUN_HOME/.config/mwatcher"
@@ -89,73 +97,129 @@ FC_ADOPTED=""         # non-empty once we are reusing an existing install
 FC_EXISTING_KEY=""    # the access key that install already uses
 FC_EXISTING_ADMIN=""  # and its admin password
 
-fc_unit_dir() {
-  local u="$1" d="" p=""
+fc_is_clone() {
+  # Any plausible Fast Combo entry point. The repo has moved it before, and a stale or
+  # partial clone may have no server.js at all -- requiring that one file is what made the
+  # first version of this miss a live install and offer to re-clone over it.
+  local d="$1"
+  [ -n "$d" ] && [ -d "$d" ] || return 1
+  [ -f "$d/server.js" ] || [ -f "$d/index.js" ] || [ -f "$d/app.js" ] \
+    || [ -f "$d/src/server.js" ] || [ -f "$d/src/index.js" ] || return 1
+  return 0
+}
+
+fc_show() {  # one systemctl property; empty when systemd cannot answer
+  local u="$1" prop="$2"
   [ -n "$u" ] || return 1
-  d="$(systemctl cat "$u" 2>/dev/null | grep -E '^WorkingDirectory=' | head -1 | cut -d= -f2- || true)"
-  if [ -n "$d" ] && [ -d "$d" ]; then printf '%s' "$d"; return 0; fi
-  p="$(systemctl cat "$u" 2>/dev/null | grep -oE '/[^ "'"'"']*/server\.js' | head -1 || true)"
-  if [ -n "$p" ]; then dirname "$p"; return 0; fi
+  systemctl show "$u" -p "$prop" --value 2>/dev/null | head -1 || true
+}
+
+fc_find_unit() {
+  local u fp
+  # 1. the conventional names, confirmed through systemd itself -- cheap and reliable, and
+  #    it finds a unit whatever directory or filename the original installer chose
+  for u in fastcombo stremio-addons fastcombo-addons stremio-fastcombo; do
+    fp="$(fc_show "$u" FragmentPath)"
+    if [ -n "$fp" ] && [ -f "$fp" ]; then printf '%s' "$u"; return 0; fi
+  done
+  # 2. anything on disk that points at a stremio-addons / fastcombo tree
+  for fp in /etc/systemd/system/*.service /etc/systemd/system/*.target.wants/*.service \
+            /usr/lib/systemd/system/*.service /lib/systemd/system/*.service; do
+    [ -f "$fp" ] || continue
+    grep -qE '^(ExecStart|WorkingDirectory)=.*(stremio-addons|fastcombo)' "$fp" 2>/dev/null || continue
+    basename "$fp" .service; return 0
+  done
   return 1
 }
 
-fc_unit_envfile() {
-  local u="$1"
+fc_unit_dir() {
+  local u="$1" d="" js=""
   [ -n "$u" ] || return 1
-  systemctl cat "$u" 2>/dev/null | grep -E '^EnvironmentFile=' | head -1 | sed -E 's/^EnvironmentFile=-?//' || true
+  d="$(fc_show "$u" WorkingDirectory)"; d="${d#-}"
+  if [ -n "$d" ] && [ -d "$d" ]; then printf '%s' "$d"; return 0; fi
+  js="$(fc_show "$u" ExecStart | grep -oE '/[^ ;]*\.js' | head -1 || true)"
+  if [ -n "$js" ] && [ -f "$js" ]; then dirname "$js"; return 0; fi
+  return 1
 }
 
-# Read one VAR=value out of an env file. Prints nothing (and stays exit 0) when absent.
+# Every file systemd loads for this unit (EnvironmentFiles=) plus the fragment itself,
+# which carries any inline Environment= lines.
+fc_unit_envfiles() {
+  local u="$1" fp=""
+  [ -n "$u" ] || return 1
+  # Dedicated secret files first: systemd applies Environment= and then lets
+  # EnvironmentFile= override it, so the file is the value actually in effect. An inline
+  # Environment=FC_ACCESS_KEY= in the fragment is the stale one more often than not.
+  fc_show "$u" EnvironmentFiles | grep -oE '/[^ (]+' || true
+  fp="$(fc_show "$u" FragmentPath)"
+  [ -n "$fp" ] && printf '%s\n' "$fp"
+  return 0
+}
+
+# VAR=value out of an env file or a unit fragment. Empty (and exit 0) when absent.
 fc_var_from() {
   local f="$1" v="$2"
-  [ -n "$f" ] && [ -f "$f" ] || return 1
-  grep -E "^$v=" "$f" 2>/dev/null | head -1 | cut -d= -f2- || true
+  [ -n "$f" ] && [ -r "$f" ] || return 1   # -r, not -f: callers pass process substitutions
+  grep -E "^[[:space:]]*(Environment=)?(export[[:space:]]+)?$v=" "$f" 2>/dev/null | tail -1 \
+    | sed -E "s/^[[:space:]]*(Environment=)?(export[[:space:]]+)?$v=//" \
+    | sed -E 's/^"(.*)"$/\1/; s/^'"'"'(.*)'"'"'$/\1/' || true
 }
 
 fc_detect_existing() {
   FC_ADOPTED=""; FC_UNIT=""; FC_EXISTING_KEY=""; FC_EXISTING_ADMIN=""
-  # Addons served from another machine: there is nothing local to adopt, and probing this
-  # box's units would only produce a misleading "already installed".
+  # Addons served from another machine: nothing local to adopt, and probing this box's
+  # units would only produce a misleading "already installed".
   fc_is_remote && return 0
 
-  local f u d k
-  # 1. any unit that runs a stremio-addons / fastcombo server.js -- ours, or theirs
-  for f in /etc/systemd/system/*.service /lib/systemd/system/*.service; do
-    [ -f "$f" ] || continue
-    grep -qE '^(ExecStart|WorkingDirectory)=.*(stremio-addons|fastcombo)' "$f" 2>/dev/null || continue
-    u="${f##*/}"; FC_UNIT="$u"; break
-  done
-
-  # 2. run Fast Combo from wherever that unit actually runs it, not from our default path
+  local d f k
+  FC_UNIT="$(fc_find_unit || true)"
   if [ -n "$FC_UNIT" ]; then
     d="$(fc_unit_dir "$FC_UNIT" || true)"
     if [ -n "$d" ] && [ -d "$d" ]; then FC_DIR="$d"; fi
   fi
 
-  # 3. no unit, but a clone sitting in an obvious place
-  if [ ! -f "$FC_DIR/server.js" ]; then
+  # no unit (or it points nowhere readable): look for a clone in the obvious places
+  if ! fc_is_clone "$FC_DIR"; then
     for d in "$RUN_HOME/stremio-addons" "$RUN_HOME/fastcombo" "$RUN_HOME/stremio-fastcombo" \
-             /opt/stremio-addons /srv/stremio-addons; do
-      if [ -f "$d/server.js" ] || [ -d "$d/.git" ]; then FC_DIR="$d"; break; fi
+             /opt/stremio-addons /opt/fastcombo /srv/stremio-addons; do
+      if fc_is_clone "$d"; then FC_DIR="$d"; break; fi
     done
   fi
 
-  # 4. the credentials that install already uses -- ours, the unit's, or the clone's .env
-  for f in "$CONFIG_DIR/fastcombo.env" "$(fc_unit_envfile "$FC_UNIT" 2>/dev/null || true)" \
-           "$FC_DIR/.env" "$RUN_HOME/.config/fastcombo.env" "$RUN_HOME/.config/fastcombo/fastcombo.env"; do
+  # credentials, most authoritative first
+  for f in "$CONFIG_DIR/fastcombo.env" "$FC_DIR/.env" "$FC_DIR/config.env" \
+           "$RUN_HOME/.config/fastcombo.env" "$RUN_HOME/.config/fastcombo/fastcombo.env" \
+           "$RUN_HOME/.config/stremio-addons/env"; do
     if [ -z "$FC_EXISTING_KEY" ]; then
-      k="$(fc_var_from "$f" 'FC_ACCESS_KEY' 2>/dev/null || true)"
-      [ -z "$k" ] && k="$(fc_var_from "$f" 'FASTCOMBO_ACCESS_KEY' 2>/dev/null || true)"
+      k="$(fc_var_from "$f" FC_ACCESS_KEY 2>/dev/null || true)"
+      [ -z "$k" ] && k="$(fc_var_from "$f" FASTCOMBO_ACCESS_KEY 2>/dev/null || true)"
       [ -n "$k" ] && FC_EXISTING_KEY="$k"
     fi
     if [ -z "$FC_EXISTING_ADMIN" ]; then
-      k="$(fc_var_from "$f" 'FC_ADMIN_PASSWORD' 2>/dev/null || true)"
+      k="$(fc_var_from "$f" FC_ADMIN_PASSWORD 2>/dev/null || true)"
       [ -n "$k" ] && FC_EXISTING_ADMIN="$k"
     fi
   done
 
-  # 5. adopt when there is a unit or a real clone to adopt
-  if [ -n "$FC_UNIT" ] || [ -f "$FC_DIR/server.js" ]; then FC_ADOPTED="yes"; fi
+  # then whatever the running service itself was started with
+  if [ -n "$FC_UNIT" ]; then
+    [ -z "$FC_EXISTING_KEY" ]   && FC_EXISTING_KEY="$(fc_var_from <(fc_show "$FC_UNIT" Environment | tr ' ' '\n') FC_ACCESS_KEY 2>/dev/null || true)"
+    [ -z "$FC_EXISTING_ADMIN" ] && FC_EXISTING_ADMIN="$(fc_var_from <(fc_show "$FC_UNIT" Environment | tr ' ' '\n') FC_ADMIN_PASSWORD 2>/dev/null || true)"
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      if [ -z "$FC_EXISTING_KEY" ]; then
+        k="$(fc_var_from "$f" FC_ACCESS_KEY 2>/dev/null || true)"
+        [ -z "$k" ] && k="$(fc_var_from "$f" FASTCOMBO_ACCESS_KEY 2>/dev/null || true)"
+        [ -n "$k" ] && FC_EXISTING_KEY="$k"
+      fi
+      if [ -z "$FC_EXISTING_ADMIN" ]; then
+        k="$(fc_var_from "$f" FC_ADMIN_PASSWORD 2>/dev/null || true)"
+        [ -n "$k" ] && FC_EXISTING_ADMIN="$k"
+      fi
+    done < <(fc_unit_envfiles "$FC_UNIT" 2>/dev/null || true)
+  fi
+
+  if [ -n "$FC_UNIT" ] || fc_is_clone "$FC_DIR"; then FC_ADOPTED="yes"; fi
   return 0
 }
 
@@ -172,6 +236,11 @@ bad()  { printf '  %s✗%s %s\n' "$E" "$R" "$*"; }
 info() { printf '  %s·%s %s\n' "$D" "$R" "$*"; }
 hdr()  { printf '\n%s%s%s\n' "$B$C" "$*" "$R"; }
 die()  { printf '\n%sERROR:%s %s\n' "$B$E" "$*" >&2; exit 1; }
+
+# set -e exits SILENTLY. That cost a real install: it stopped dead after "4. Fast Combo"
+# with no message at all, leaving Plex configured but no bridge, no keys and no unit, and
+# nothing on screen to say why. If a command fails, say which one and where.
+trap 'printf "\n%sERROR:%s install.sh:%s failed (exit %s)\n  command: %s\n  the install is INCOMPLETE -- fix the above and re-run it; it picks up where it left off\n" "$B$E" "$R" "$LINENO" "$?" "$BASH_COMMAND" >&2' ERR
 
 need_root() {
   [ "$(id -u)" = "0" ] || die "this needs sudo:  sudo bash install.sh $1"
@@ -646,7 +715,17 @@ do_doctor() {
 # =============================================================================
 #  install
 # =============================================================================
-gen_key() { tr -dc 'A-Za-z0-9' </dev/urandom | head -c "${1:-16}"; }
+gen_key() {
+  # head -c closing an endless `tr </dev/urandom` sends SIGPIPE, pipefail turns that into a
+  # failed pipeline, and set -e then kills the installer mid-run with NO message at all --
+  # which is exactly what happened on a real box: it stopped after "4. Fast Combo". Read a
+  # bounded chunk instead, so nothing is ever interrupted.
+  local n="${1:-16}" out=""
+  while [ "${#out}" -lt "$n" ]; do
+    out="$out$(head -c 512 /dev/urandom | LC_ALL=C tr -dc 'A-Za-z0-9')"
+  done
+  printf '%s' "${out:0:n}"
+}
 
 do_install() {
   need_root "install"
