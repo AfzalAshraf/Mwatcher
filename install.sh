@@ -165,6 +165,48 @@ fc_var_from() {
     | sed -E 's/^"(.*)"$/\1/; s/^'"'"'(.*)'"'"'$/\1/' || true
 }
 
+# Play-through (action=strm) writes the bridge's own address into every .strm, and Plex
+# clients on OTHER machines have to reach it. The loopback bind in the unit is right for
+# downloading, but with play-through on it produces a particularly confusing failure: the
+# title plays on the server itself and gives s1001 on every phone and TV.
+pt_enabled() {
+  local f="$CONFIG_DIR/bridge.env" act="" pub=""
+  [ -f "$f" ] || return 1
+  act="$(fc_var_from "$f" TELESTREAM_ACTION 2>/dev/null || true)"
+  [ "$act" = "strm" ] && return 0
+  pub="$(fc_var_from "$f" TELESTREAM_PUBLIC_BASE_URL 2>/dev/null || true)"
+  case "$pub" in
+    ""|*127.0.0.1*|*localhost*|*0.0.0.0*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# Is the bridge listening beyond loopback? bridge.env wins over the unit, because
+# EnvironmentFile= comes after Environment= in mwatcher-bridge.service.
+bridge_lan_bound() {
+  local h=""
+  h="$(fc_var_from "$CONFIG_DIR/bridge.env" BRIDGE_HOST 2>/dev/null || true)"
+  if [ -z "$h" ]; then
+    h="$(sed -n 's/^Environment=BRIDGE_HOST=//p' /etc/systemd/system/mwatcher-bridge.service 2>/dev/null | head -1 || true)"
+  fi
+  case "$h" in ""|127.0.0.1|localhost) return 1 ;; esac
+  return 0
+}
+
+lan_ip() { ip route get 1.1.1.1 2>/dev/null | grep -o 'src [0-9.]*' | awk '{print $2}' | head -1 || true; }
+
+# Set VAR in bridge.env -- replace the line (even a commented one) or append it.
+bridge_env_set() {
+  local v="$1" val="$2" f="$CONFIG_DIR/bridge.env"
+  [ -f "$f" ] || return 1
+  if grep -qE "^[[:space:]]*#?[[:space:]]*$v=" "$f" 2>/dev/null; then
+    sed -i -E "s|^[[:space:]]*#?[[:space:]]*$v=.*|$v=$val|" "$f"
+  else
+    printf '%s=%s\n' "$v" "$val" >> "$f"
+  fi
+  return 0
+}
+
 fc_detect_existing() {
   FC_ADOPTED=""; FC_UNIT=""; FC_EXISTING_KEY=""; FC_EXISTING_ADMIN=""
   # Addons served from another machine: nothing local to adopt, and probing this box's
@@ -433,6 +475,31 @@ do_doctor() {
     fi
   fi
   port_open 32400 && ok "Plex listening on 32400" || { bad "nothing on 32400"; problems=$((problems+1)); }
+
+  # Play-through readiness. Worth checking before any .strm exists, because the failure
+  # mode is bizarre: the title plays on the server and nowhere else.
+  if pt_enabled; then
+    local pt_pub
+    pt_pub="$(fc_var_from "$CONFIG_DIR/bridge.env" TELESTREAM_PUBLIC_BASE_URL 2>/dev/null || true)"
+    if bridge_lan_bound; then
+      ok "play-through: the bridge listens beyond loopback, so clients can stream through it"
+    else
+      bad "play-through is enabled but the bridge only listens on 127.0.0.1: every .strm plays
+       on THIS box and fails with s1001 on every other client.
+       Fix: echo 'BRIDGE_HOST=0.0.0.0' | sudo tee -a $CONFIG_DIR/bridge.env
+            sudo systemctl restart mwatcher-bridge"
+      problems=$((problems+1))
+    fi
+    case "$pt_pub" in
+      "")   warn "play-through: TELESTREAM_PUBLIC_BASE_URL is unset, so .strm files get this box's
+       LAN address — fine at home, s1001 away from it";;
+      *127.0.0.1*|*localhost*|*0.0.0.0*)
+          bad "play-through: TELESTREAM_PUBLIC_BASE_URL=$pt_pub is loopback, so only this machine
+       can play .strm titles. Set it to the address your clients use for this box."
+          problems=$((problems+1));;
+      *)    ok "play-through: TELESTREAM_PUBLIC_BASE_URL=$pt_pub";;
+    esac
+  fi
 
   # ---- 2. Plex itself answers ----------------------------------------------
   hdr "2. Plex server"
@@ -932,6 +999,36 @@ EOF
     ok "recorded the remote addon URL in bridge.env"
   fi
 
+  # ---- 5b. play-through must be reachable from clients, not just from here ---
+  if pt_enabled; then
+    if bridge_lan_bound; then
+      ok "bridge listens beyond loopback, as play-through needs"
+    else
+      bridge_env_set BRIDGE_HOST 0.0.0.0 || true
+      warn "play-through is on, so the bridge must answer your LAN — added BRIDGE_HOST=0.0.0.0
+       to bridge.env (which overrides the unit's loopback default). Without it every .strm
+       plays on THIS box and fails with s1001 on every phone and TV."
+    fi
+    local pub ip
+    pub="$(fc_var_from "$CONFIG_DIR/bridge.env" TELESTREAM_PUBLIC_BASE_URL 2>/dev/null || true)"
+    case "$pub" in
+      ""|*127.0.0.1*|*localhost*|*0.0.0.0*)
+        ip="$(lan_ip)"
+        if [ -n "$ip" ]; then
+          bridge_env_set TELESTREAM_PUBLIC_BASE_URL "http://$ip:$BRIDGE_PORT" || true
+          ok "TELESTREAM_PUBLIC_BASE_URL=http://$ip:$BRIDGE_PORT (this box's LAN address)"
+          info "that is what gets written into the .strm files, so it must be an address your
+       Plex clients can reach — away from home, use your Tailscale IP instead"
+        else
+          warn "play-through is on but this box's LAN address could not be determined.
+       Set TELESTREAM_PUBLIC_BASE_URL in $CONFIG_DIR/bridge.env to the address your
+       Plex clients use for this machine."
+        fi
+        ;;
+      *) ok "TELESTREAM_PUBLIC_BASE_URL=$pub" ;;
+    esac
+  fi
+
   # ---- 6. systemd units ----------------------------------------------------
   hdr "6. Services"
   local units="fastcombo mwatcher-bridge"
@@ -973,10 +1070,24 @@ EOF
   hdr "7. Firewall"
   if have ufw && ufw status 2>/dev/null | grep -qi active; then
     ufw allow from 192.168.0.0/16 to any >/dev/null 2>&1 || true
-    ok "LAN allowed (Fast Combo and the bridge stay loopback-only on purpose)"
+    if bridge_lan_bound; then
+      ufw allow from 192.168.0.0/16 to any port "$BRIDGE_PORT" proto tcp >/dev/null 2>&1 || true
+      ok "LAN allowed, including $BRIDGE_PORT for play-through"
+      info "Fast Combo stays loopback-only; the bridge is LAN-only and NOT reachable from the
+       internet — /play/<key> has no authentication, so keep it that way"
+    else
+      ok "LAN allowed (Fast Combo and the bridge stay loopback-only on purpose)"
+    fi
     info "Plex remote access: forward TCP 32400 on your router, or use Tailscale (§5d of the guide)"
   else
     info "ufw not active — nothing to do"
+    if bridge_lan_bound; then
+      warn "no firewall is active while the bridge listens on the LAN. On a box with a public
+       interface that exposes /play/<key>, which has no authentication. Enable ufw:
+            sudo ufw allow from 192.168.0.0/16 to any port $BRIDGE_PORT proto tcp
+            sudo ufw enable
+       or keep it private with Tailscale instead (§5d)."
+    fi
   fi
 
   do_status

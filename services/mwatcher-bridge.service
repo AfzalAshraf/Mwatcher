@@ -97,6 +97,15 @@ EnvironmentFile=/home/afine/.config/mwatcher/bridge.env
 # TELESTREAM_PUBLIC_BASE_URL is the one that matters: it is the address written into the
 # .strm, and it must be reachable from your Plex CLIENTS -- not from this server. Leave it
 # unset and you get the LAN IP; pointing it at 127.0.0.1 gives every remote device s1001.
+#
+# BRIDGE_HOST is the other half of that, and it is easy to miss: play-through only works if
+# the bridge actually LISTENS on the address you put in the .strm. BRIDGE_HOST=127.0.0.1
+# above means every .strm plays on this box and fails with s1001 on every phone and TV.
+# Prefer setting it in ~/.config/mwatcher/bridge.env -- that file is read by EnvironmentFile=
+# further down, which overrides Environment=, so it survives this unit being rewritten.
+# Set BRIDGE_HOST=0.0.0.0 and keep the port LAN-only in the firewall; /play/<key> has no
+# authentication, so never expose it to the internet (use Tailscale instead).
+#Environment=BRIDGE_HOST=0.0.0.0
 #Environment=TELESTREAM_ACTION=stream
 #Environment=TELESTREAM_PUBLIC_BASE_URL=http://192.168.0.34:8889
 #Environment=TELESTREAM_CACHE_DIR=/home/afine/media/cache

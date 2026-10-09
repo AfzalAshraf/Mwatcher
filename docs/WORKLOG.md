@@ -101,6 +101,7 @@ which *is* error s1001. Read the first `CHUNK`, run `sniff_html()` plus a
 | `gen_key` under `set -Eeuo pipefail` | 16/12/24 chars, no SIGPIPE, no silent exit |
 | `ERR` trap | fires on an injected failure naming line + command; silent on success |
 | `bridge.env` repair | key appended when absent · corrected when wrong · no-op on re-run · 664 → 600 |
+| play-through reachability | 12 helper checks + 4 end-to-end: bind widened, LAN IP derived, idempotent, untouched when off |
 
 ### Adopting an existing Fast Combo (layout C — all on the VPS)
 
@@ -227,7 +228,17 @@ bogus `/play/deadbeef00.mkv` → 404 · `status`/`doctor`/`--help` exit 0.
     can be determined, and tighten the file to mode 600 — `nano` leaves 664, which leaks an
     access key to every local user. Verified on all four paths, including that a re-run
     changes nothing.
-18. **Test fixtures that share a scratch directory must not clean each other's.** Two
+18. **`BRIDGE_HOST=127.0.0.1` silently defeats play-through.** The unit binds loopback, but
+    `.strm` files carry `TELESTREAM_PUBLIC_BASE_URL` and Plex clients on other machines must
+    reach it. Result: a title plays on the server and gives s1001 on every phone and TV — the
+    most confusing possible failure, because the machine you test on works. Doctor caught it
+    *after* a `.strm` existed; nothing caught it at install time, and the unit even shipped a
+    commented `TELESTREAM_PUBLIC_BASE_URL=http://192.168.0.34:8889` sitting right next to
+    `Environment=BRIDGE_HOST=127.0.0.1`. §5b now widens the bind when play-through is on and
+    derives the LAN address if unset. `EnvironmentFile=` comes *after* `Environment=` in the
+    unit, so writing `BRIDGE_HOST` into `bridge.env` overrides it and survives the unit being
+    rewritten — no `override.conf` needed.
+19. **Test fixtures that share a scratch directory must not clean each other's.** Two
     regression scripts both used `/tmp/fc`; the second deleted it on entry, so the first
     "failed" when run afterwards. Ordering artefacts look exactly like regressions — run each
     suite in isolation before believing a failure.
@@ -308,6 +319,8 @@ Breaking Bad `.strm` at 45 B under `TV Shows/Breaking Bad/Season 01/`.
       `fastcombo-tunnel.service` can start unattended.
 - [ ] Seerr is only ever tested against `demo/fake_seerr.py`; the compose stack
       is YAML-validated only (no Docker in the sandbox).
+- [ ] Away from home, play-through needs `TELESTREAM_PUBLIC_BASE_URL` pointed at a Tailscale
+      IP; the installer cannot know that address, so it only ever derives the LAN one.
 - [ ] `TELESTREAM_CACHE_MAX_GB` default is 20 in code; the demo runs 50.
       Undecided whether 50 should become the shipped default.
 
