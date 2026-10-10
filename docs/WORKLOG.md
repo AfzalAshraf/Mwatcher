@@ -119,6 +119,7 @@ which *is* error s1001. Read the first `CHUNK`, run `sniff_html()` plus a
 | `bridge_bind_reality` | decides correctly on all 5 synthetic listener shapes (loopback, wildcard, explicit LAN IP, both, IPv6 loopback); reports every listener, not the first |
 | `do_HEAD` | 200 on `/healthz`, 404 on an unknown play key — was `501 Unsupported method` |
 | `install.sh update` | pull → daemon-reload → restart → repoint → libraries → verify, exit 0; a private box behind NAT cannot be pushed to, so updates are pulled |
+| doctor §3 probe | HEAD instead of GET: 200 = healthy (9 ms), 404 = orphaned pointer, 000 = unreachable, 5xx reported as itself. The GET probe needed a 10-20 s scrape and always blew its 8 s budget |
 | doctor §3 reachability | now decides on the HTTP status, not curl's exit code: `/healthz` reachable, dead port still `UNREACHABLE`, `HEAD` 200 (was 501) |
 | sudo and `MEDIA_DIR` | `SUDO_USER=afine` → `/home/afine/media`; unknown user → `/home/<u>/media`; explicit `MEDIA_DIR` wins; `/root/media` is refused outright |
 
@@ -343,7 +344,14 @@ bogus `/play/deadbeef00.mkv` → 404 · `status`/`doctor`/`--help` exit 0.
     SSH-deploy workflow is not available here — and opening a hole to enable it would be the
     wrong trade for a box whose `/play/<key>` has no authentication. Updates are pulled from
     the box: `install.sh update`. Never accept a user's SSH private key to work around this.
-38. **Test fixtures that share a scratch directory must not clean each other's.** Two
+38. **Never probe a play-through URL with GET.** `/play/<key>` scrapes a fresh link before
+    it can answer, which measured 14 s for Dune against real addons, so doctor's 8 s probe
+    timed out and reported "the bridge does not answer that URL at all" on a bridge that was
+    listening on `0.0.0.0:8889` and had just served a 206. HEAD answers from the play table
+    in ~9 ms without touching the network, and its status is *more* informative: 200 live,
+    404 orphaned, 000 unreachable. Note the old curl-exit test was wrong in both directions
+    -- it also read a 502 as reachable, since curl without `-f` exits 0 on an error status.
+39. **Test fixtures that share a scratch directory must not clean each other's.** Two
     regression scripts both used `/tmp/fc`; the second deleted it on entry, so the first
     "failed" when run afterwards. Ordering artefacts look exactly like regressions — run each
     suite in isolation before believing a failure.

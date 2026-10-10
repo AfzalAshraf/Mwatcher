@@ -635,27 +635,42 @@ do_doctor() {
               ok "  play-through pointer — no downloaded file, that is intentional"
               local tpath code code2
               tpath="$(printf '%s' "$target" | sed -E 's#^[a-zA-Z]+://[^/]+##')"
-              # Test REACHABILITY, not transfer completeness. curl's exit status lies here:
-              # the bridge answers a 2-byte range with 206 and then closes, which curl can
-              # report as a failed transfer (18) even though the server answered perfectly.
-              # That is how this printed "answers locally but NOT at that address" while the
-              # bridge's own log showed a 206 from that very address. Any HTTP status means
-              # it is reachable; only 000 means the connection never happened.
-              code="$(curl -s -m 8 -o /dev/null -w '%{http_code}' -r 0-1 "$target" 2>/dev/null || true)"
-              code2="$(curl -s -m 8 -o /dev/null -w '%{http_code}' -r 0-1 "http://127.0.0.1:$BRIDGE_PORT$tpath" 2>/dev/null || true)"
+              # Probe with HEAD, never GET. A GET on /play/<key> makes the bridge scrape a
+              # fresh link first, which routinely takes 10-20s (Dune measured 14s), so an 8s
+              # timeout reported "the bridge does not answer that URL at all" on a perfectly
+              # healthy setup that was listening on 0.0.0.0:8889. HEAD answers straight from
+              # the play table without touching the network, so it tests exactly what this
+              # section is about: can a client reach this address, and is the key known.
+              #   200 = reachable and the key is live
+              #   404 = reachable but the pointer is orphaned
+              #   000 = nothing answered; the connection never happened
+              code="$(curl -s -m 10 -o /dev/null -w '%{http_code}' -I "$target" 2>/dev/null || true)"
+              code2="$(curl -s -m 10 -o /dev/null -w '%{http_code}' -I "http://127.0.0.1:$BRIDGE_PORT$tpath" 2>/dev/null || true)"
               [ -n "$code" ] || code="000"
               [ -n "$code2" ] || code2="000"
-              if [ "$code" != "000" ]; then
-                ok "  the bridge answers that URL (HTTP $code), so clients can stream through it"
-              elif [ "$code2" != "000" ]; then
-                warn "  the bridge answers locally (HTTP $code2) but NOT at that address (got
-  $code) — clients on other machines will get s1001. Check the firewall, the IP, and any
-  tunnel:
+              if [ "$code" = "000" ] && [ "$code2" != "000" ]; then
+                warn "  the bridge answers locally (HTTP $code2) but NOT at that address — clients
+  on other machines get s1001. Check the firewall and the IP:
        sudo ufw allow from 192.168.0.0/16 to any port $BRIDGE_PORT"
                 problems=$((problems+1))
+              elif [ "$code" = "000" ]; then
+                bad "  nothing answers that URL (neither address) — s1001.
+  Fix: sudo systemctl restart mwatcher-bridge, then re-test playback"
+                problems=$((problems+1))
+              elif [ "$code" = "404" ]; then
+                bad "  the bridge is reachable but does not know that play key, so the pointer is
+  orphaned. Fix: python3 $REPO_DIR/scripts/telestream_to_plex.py --repoint
+       then:      sudo systemctl restart mwatcher-bridge"
+                problems=$((problems+1))
+              elif [ "${code#2}" != "$code" ]; then
+                ok "  the bridge answers that URL (HTTP $code) and knows that play key"
+                info "  that proves reachability only — a real play also needs the scrape to
+  succeed, which takes 10-20s. To watch one happen:
+       curl -s -m 60 -r 0-1000 -o /dev/null -w '%{http_code} %{size_download}b' \"$target\""
               else
-                bad "  the bridge does not answer that URL at all (neither address answered) —
-  s1001. Fix: sudo systemctl restart mwatcher-bridge, then re-test playback"
+                bad "  the bridge answered that URL with HTTP $code, which is neither healthy
+  nor a missing key. Check what it said:
+       sudo journalctl -u mwatcher-bridge -n 40 --no-pager"
                 problems=$((problems+1))
               fi
               case "$target" in
