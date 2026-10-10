@@ -1,6 +1,6 @@
 # Stremio addons → Plex Edition
 
-Access your **Plex Media Server** (on Lubuntu, `192.168.0.34`) from anywhere in the world — mobile data,
+Access your **Plex Media Server** (on Lubuntu, `192.168.0.200`) from anywhere in the world — mobile data,
 outside the house, devices not on your Wi-Fi — and play the videos your **Stremio addons** find
 (merged and ranked by [Fast Combo](https://github.com/AfzalAshraf/stremio-addons)) **inside the Plex app**.
 
@@ -23,7 +23,7 @@ Two things changed compared to the old Stremio setup, and they matter:
 
 ## 0. Prerequisites
 
-- Lubuntu box reachable on the LAN at `192.168.0.34` (keep this IP — reserve it in your router's DHCP table).
+- Lubuntu box reachable on the LAN at `192.168.0.200` (keep this IP — reserve it in your router's DHCP table).
 - A Plex account (free): <https://app.plex.tv/auth>
 - Node 18+ and your [Fast Combo](https://github.com/AfzalAshraf/stremio-addons) addons working locally.
 - A downloader: `yt-dlp` (best), `ffmpeg`, or `curl`.
@@ -128,7 +128,7 @@ chmod -R a+rX /home/afine/media      # or put the library somewhere plex can alr
 
 ## 3. First-run setup + library layout
 
-1. On the Lubuntu box (or any LAN device) open **`http://192.168.0.34:32400/web`**.
+1. On the Lubuntu box (or any LAN device) open **`http://192.168.0.200:32400/web`**.
 2. Sign in with your Plex account → **claim the server** → name it (e.g. `MasterHub`).
 3. Create the library folders and add them as libraries:
 
@@ -392,11 +392,10 @@ live link probing (the fake files answer `Range` requests, which is what it prob
 
 ### 4.5 What this does NOT do (be honest about the trade-off)
 
-- **By default it downloads; it does not stream on demand.** Unlike Stremio, the file lands on disk
-  before Plex can play it. Budget disk space and the time to fetch it (a 4K movie is 15-25 GB).
-  That is the price of "the best copy of what you asked for, playable on every Plex client forever".
-  If you would rather keep nothing on disk, see **§4.6** — play-through adds a title as a 45-byte
-  pointer and streams it through a capped cache instead.
+- **Download mode is the dependable Plex path.** The real media file lands on disk before playback;
+  budget space and fetch time (a 4K movie is 15-25 GB). Play-through (§4.6) avoids a permanent media
+  download, but Plex `.strm` handling varies by server/client and is not guaranteed across apps.
+  Test the exact clients you use before choosing it as your only path.
 - **Torrent/debrid links are skipped.** Addons that return `infoHash` need Real-Debrid/TB/alldebrid-style
   resolution first. If that is most of your addons, prefer addons that return direct HTTP links, or add a
   debrid step in front of the downloader.
@@ -404,24 +403,31 @@ live link probing (the fake files answer `Range` requests, which is what it prob
   Unsupported AppStore do not load on a current Plex server, so there is no way to bolt an addon *inside*
   Plex itself. If playing live HTTP sources without downloading is a hard requirement, run **Jellyfin** or
   **Emby** alongside Plex — both still have working plugin systems.
-- **Hand-written `.strm` pointer files are unreliable.** A `.strm` is a text file containing a URL —
-  the only way to make Plex reference something remote. Written by hand it freezes a link that usually
-  expires within minutes, cannot carry the headers many hosts demand, and when the host answers with a
-  captcha page Plex tries to *play a web page*, which is error s1001:
+- **A hand-written `.strm` has two separate risks.** Its URL may expire or need headers, and Plex
+  server/client support for `.strm` is inconsistent. A client that does read it may reach an expired
+  link or a captcha page and report s1001:
 
   ```bash
   # do not do this -- see §4.6 for the version that actually works
   echo "https://files.example.com/Dune.2021.1080p.mkv" > "/home/afine/media/Movies/Dune (2021)/Dune (2021).strm"
   ```
 
-  §4.6 keeps the pointer but puts the bridge behind it, which fixes all four problems.
+  §4.6 keeps the pointer but puts the bridge behind it, which solves link freshness and headers for
+  compatible clients; it does not add `.strm` support to Plex clients that lack it.
 
-### 4.6 Play-through — add titles WITHOUT downloading them
+### 4.6 Play-through — no permanent media download (Plex client support varies)
 
-If you do not want files on disk, do not download any. The library gets a ~45-byte `.strm`
-pointer, and when Plex plays it the bridge scrapes a **fresh** link from your addons at that
-moment, opens it with whatever headers the host demands, and streams the bytes through —
-Range-aware, so seeking works — while keeping a capped cache on disk.
+This mode creates a ~45-byte `.strm` pointer rather than a permanent media file. **Plex `.strm`
+behavior is not reliable across every Plex server/client combination.** Community reports include
+some Android/Android TV setups that scan/play pointers and other clients that ignore them or fail.
+Before relying on this mode, add one title and test it on each Plex app you plan to use. If the Plex
+library is empty, first verify the library's actual folder roots; the scanner cannot discover files
+outside those roots. If your target Plex app does not support the pointer, Mwatcher cannot fix that.
+
+When a compatible Plex server/client recognizes the pointer, the bridge scrapes a **fresh** link from
+your addons at play time, opens it with whatever headers the host demands, and streams bytes through —
+Range-aware, so seeking works — while keeping a capped cache on disk. The cache is temporary playback
+storage; the `.strm` pointer itself is not the movie.
 
 ```bash
 curl -X POST http://127.0.0.1:8889/add -H 'Content-Type: application/json' \
@@ -431,7 +437,7 @@ curl -X POST http://127.0.0.1:8889/add -H 'Content-Type: application/json' \
 ```
 downloaded_bytes : 0                                  <- nothing was saved
 strm             : ~/media/Movies/Dune (2021)/Dune (2021).strm    (45 bytes)
-play_url         : http://192.168.0.34:8889/play/6f2c1ab9d0.mkv
+play_url         : http://192.168.0.200:8889/play/6f2c1ab9d0.mkv
 candidates       : 3 live links, best first
 ```
 
@@ -446,7 +452,9 @@ Why this beats writing an addon URL into a `.strm` yourself:
 | Disk | none | a capped cache (default 20 GB, evicts oldest first) |
 
 Make it the default with `TELESTREAM_ACTION=strm`, or per title with `"action":"strm"`. On the
-dashboard it is the **Add without downloading** button.
+dashboard it is the **Add without downloading** button. This selects Mwatcher's pointer mode; it
+does not guarantee support in a given Plex app. For dependable playback across Plex clients use
+`TELESTREAM_ACTION=stream`, accepting that the real media file occupies disk.
 
 ```bash
 curl -s localhost:8889/plays    # every pointer, its URL, and whether it is cached
@@ -587,14 +595,14 @@ If it works but says **"Indirect"/"Relay"**, you're being bounced through Plex's
 
 ```bash
 curl -s https://ifconfig.me; echo      # your public IPv4
-ip -4 addr show                        # confirm the box really is 192.168.0.34
+ip -4 addr show                        # confirm the box really is 192.168.0.200
 ```
 
 Router admin panel (`http://192.168.0.1` / `http://192.168.1.1`) → **Port Forwarding / Virtual Server**:
 
 | Field | Value |
 |---|---|
-| Internal IP | `192.168.0.34` |
+| Internal IP | `192.168.0.200` |
 | Internal Port | `32400` |
 | External Port | `32400` (or e.g. `45678` — less scanner noise) |
 | Protocol | **TCP** |
@@ -675,7 +683,7 @@ Now the Plex side — **all four of these are required or playback breaks in wei
 
 1. **Settings → Server → Network → Custom server access URLs** (click *Show Advanced*):
    ```text
-   http://192.168.0.34:32400,https://plex.example.com:443
+   http://192.168.0.200:32400,https://plex.example.com:443
    ```
    Put the **LAN URL first** so devices at home stay local instead of hairpinning through Cloudflare.
 2. **Settings → Server → Network → Secure connections = Preferred** (not *Required* — Plex's cert is issued
@@ -741,7 +749,7 @@ That checks, in the order these actually break:
 | 2 | **A `.strm` pointer the client cannot reach.** Loopback, or a LAN IP when you are away, or a foreign link that expired | `doctor` prints the target, says whether the bridge answers *that address*, and flags loopback/LAN/foreign | Set `TELESTREAM_PUBLIC_BASE_URL` to an address your clients reach (§4.6), then re-add the title — or delete the `.strm` and download the file instead |
 | 3 | **`plex` user cannot read the file** | `sudo -u plex test -r <file>` fails | `sudo chmod -R a+rX ~/media && sudo usermod -aG $USER plex && sudo systemctl restart plexmediaserver` |
 | 4 | **Secure connections = Required** together with a proxy/tunnel whose certificate is not Plex's `*.plex.direct` | `secureConnections="2"` in Preferences.xml | Set **Preferred** (Settings → Server → Network) |
-| 5 | **Custom server access URL points at localhost**, or the public URL is missing | `customConnections` contains `127.0.0.1`/`localhost` | `http://192.168.0.34:32400,https://plex.yourdomain.com` — LAN first (§5c) |
+| 5 | **Custom server access URL points at localhost**, or the public URL is missing | `customConnections` contains `127.0.0.1`/`localhost` | `http://192.168.0.200:32400,https://plex.yourdomain.com` — LAN first (§5c) |
 | 6 | **Dead Movie Pre-Roll URL** in Extras — fails *every* title, classic s1001 | a `…preroll…` key in Preferences.xml | Clear Settings → General → Extras → Movie pre-roll video |
 | 7 | **CGNAT / double NAT** — browsing works via Plex Relay, media cannot | public IP is in `100.64.0.0/10`, or is a private range | Tailscale (§5d) or a tunnel (§5c); port forwarding cannot work |
 | 8 | **Corrupt Plex database** | log shows `database disk image is malformed` | <https://support.plex.tv/articles/repair-a-corrupted-database/> — or `PlexDBRepair` |

@@ -2122,7 +2122,7 @@ def main(argv: list[str]) -> int:
         if "127.0.0.1" in play_base_url() or "localhost" in play_base_url():
             print("warning: .strm will point at loopback, so only THIS machine can play it.\n"
                   "         Set TELESTREAM_PUBLIC_BASE_URL (or --public-url) to the address\n"
-                  "         your Plex clients use, e.g. http://192.168.0.34:8889",
+                  "         your Plex clients use, e.g. http://192.168.0.200:8889",
                   file=sys.stderr)
 
     payload = {

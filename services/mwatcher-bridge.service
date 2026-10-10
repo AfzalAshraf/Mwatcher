@@ -107,7 +107,7 @@ EnvironmentFile=/home/afine/.config/mwatcher/bridge.env
 # authentication, so never expose it to the internet (use Tailscale instead).
 #Environment=BRIDGE_HOST=0.0.0.0
 #Environment=TELESTREAM_ACTION=stream
-#Environment=TELESTREAM_PUBLIC_BASE_URL=http://192.168.0.34:8889
+#Environment=TELESTREAM_PUBLIC_BASE_URL=http://192.168.0.200:8889
 #Environment=TELESTREAM_CACHE_DIR=/home/afine/media/cache
 #Environment=TELESTREAM_CACHE_MAX_GB=20
 #Environment=TELESTREAM_CACHE=1

@@ -16,7 +16,7 @@ it does.
 | Branch | `arena/e20948b7-mwatcher` |
 | Pushed HEAD | `7daed62` — verify with `git ls-remote --heads origin arena/e20948b7-mwatcher` |
 | History | `32c014c` initial → `d46ab5a` bridge+installer → `caf563e` Seerr → `bceb51e` play-through → `7daed62` split topology |
-| Deploy target | **Lubuntu box** `afine@192.168.0.34` (Plex + library + bridge). Addons run on a **separate VPS** `ubuntu@stremio-vnic`. |
+| Deploy target | **Lubuntu box** `afine@192.168.0.200` (Plex + library + bridge). Addons run on a **separate VPS** `ubuntu@stremio-vnic`. |
 
 The installer is the entry point: `sudo bash ~/Mwatcher/install.sh`.
 Subcommands: `status`, `doctor [title]`, `seerr`, `uninstall`, `--help`.
@@ -253,7 +253,7 @@ bogus `/play/deadbeef00.mkv` → 404 · `status`/`doctor`/`--help` exit 0.
     reach it. Result: a title plays on the server and gives s1001 on every phone and TV — the
     most confusing possible failure, because the machine you test on works. Doctor caught it
     *after* a `.strm` existed; nothing caught it at install time, and the unit even shipped a
-    commented `TELESTREAM_PUBLIC_BASE_URL=http://192.168.0.34:8889` sitting right next to
+    commented `TELESTREAM_PUBLIC_BASE_URL=http://192.168.0.200:8889` sitting right next to
     `Environment=BRIDGE_HOST=127.0.0.1`. §5b now widens the bind when play-through is on and
     derives the LAN address if unset. `EnvironmentFile=` comes *after* `Environment=` in the
     unit, so writing `BRIDGE_HOST` into `bridge.env` overrides it and survives the unit being
@@ -351,22 +351,23 @@ bogus `/play/deadbeef00.mkv` → 404 · `status`/`doctor`/`--help` exit 0.
     in ~9 ms without touching the network, and its status is *more* informative: 200 live,
     404 orphaned, 000 unreachable. Note the old curl-exit test was wrong in both directions
     -- it also read a 502 as reachable, since curl without `-f` exits 0 on an error status.
-39. **PLEX CANNOT PLAY `.strm` FILES AT ALL.** The single most expensive mistake in this
-    project: an entire play-through feature — `/play/<key>`, `/add`, the persisted play table,
-    `--repoint`, LAN binding, firewall rules, doctor checks — was built and debugged for weeks
-    on a container that has not supported the format since roughly 2018. Plex's scanner either
-    ignores `.strm` (library shows EMPTY) or indexes it and fails with s1001, because a
-    46-byte text file has no video stream. **The s1001 research already said the top cause is
-    "the file is not a video file" and that was the answer the whole time.** Sources: Plex
-    forum feature-request thread "[REQ] ADD STRM Support" (2018, still open), r/PleX ".strm
-    file support" (2018: "Plex removed support for strm files... plex still sees the file and
-    gives you false hope"), Channels community (2020: "plex used to work with *.Strm but
-    stopped support about a few years back"), rdt-client #76 (2021: "Kodi, Emby, Jellyfin
-    (not Plex!)"), firecore/Infuse (2025: "Plex itself doesn't support streaming .strm
-    files"), archive-movie-browser PR #375 (Sep 2026: "says Plex can't read .strm files").
-    Emby, Jellyfin and Kodi DO support it, so the code stays — but **verify the target
-    platform supports a format before building on it.** For Plex the working path is
-    `TELESTREAM_ACTION=stream`: download the real file.
+39. **Correction: Plex `.strm` behavior is inconsistent; the previous "cannot play at all" claim
+    was too categorical.** The feature request "[REQ] ADD STRM Support" remains active, and many
+    users report no native support; however, the Plex forum also contains reports of `.strm` files
+    being scanned and playing on some Android/Android TV clients while Plex Web/Apple clients fail.
+    Third-party apps may read the URL themselves, which is not proof that Plex handles it. The
+    defensible statement is: **Mwatcher cannot promise `.strm` playback across Plex server/client
+    combinations; test the actual apps in use.** A healthy HEAD to `/play/<key>` proves bridge/key
+    reachability only, not Plex scanner or player compatibility. For dependable playback across Plex
+    clients, `TELESTREAM_ACTION=stream` uses a real media file (which consumes disk); if no permanent
+    download is mandatory, use a `.strm`-capable server/client or accept client-specific behavior.
+    Sources: [Plex feature request](https://forums.plex.tv/t/req-add-strm-support/233521), [Plex
+    discussion](https://forums.plex.tv/t/strm-support/233040), and [Firecore reports](https://community.firecore.com/t/failed-to-read-strm-file-from-plex/54084).
+    **Concrete cause for the current empty library:** the field `--sections` output showed Movies
+    id 5 → `/root/media/Movies` and TV Shows id 6 → `/root/media/TV Shows`, while the intended user
+    media root is `/home/afine/media`. That path mismatch must be fixed and scanned before concluding
+    that a Plex scanner ignored `.strm`. The bridge was separately verified listening on
+    `0.0.0.0:8889`; do not repeat the stale loopback diagnosis for that field run.
 40. **Test fixtures that share a scratch directory must not clean each other's.** Two
     regression scripts both used `/tmp/fc`; the second deleted it on entry, so the first
     "failed" when run afterwards. Ordering artefacts look exactly like regressions — run each
@@ -405,7 +406,7 @@ TELESTREAM_STAGING=/tmp/mwatcher-demo/staging
 TELESTREAM_MOVIES_DIR=/tmp/mwatcher-demo/Movies
 TELESTREAM_TV_DIR='/tmp/mwatcher-demo/TV Shows'
 TELESTREAM_CACHE_DIR=/tmp/mwatcher-demo/cache TELESTREAM_CACHE_MAX_GB=50
-TELESTREAM_PUBLIC_BASE_URL=http://192.168.0.34:8889
+TELESTREAM_PUBLIC_BASE_URL=http://192.168.0.200:8889
 TELESTREAM_DOWNLOAD_CMD='curl -fsSL --retry 1 {headers} -o {out} {stream}'
 TELESTREAM_MIN_BYTES=100
 SEERR_URL=http://127.0.0.1:5055 SEERR_API_KEY=testkey SEERR_MODE=off

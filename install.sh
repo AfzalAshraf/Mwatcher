@@ -461,8 +461,8 @@ do_status() {
   nstrm="$(find "$MEDIA_DIR" -type f -iname '*.strm' 2>/dev/null | wc -l || echo 0)"
   if [ "${nstrm:-0}" -gt 0 ]; then
     info "$nstrm .strm pointer file(s) — play-through mode: the bridge scrapes a fresh link"
-    info "                                    and streams it, so nothing is downloaded"
-    info "                                    (doctor checks each one is client-reachable)"
+    info "                                    and streams it without a permanent media download"
+    info "                                    (Plex indexing/playback varies by client; doctor checks URLs)"
   fi
   local npart
   npart="$(find "$MEDIA_DIR/staging" -type f 2>/dev/null | wc -l || echo 0)"
@@ -548,6 +548,29 @@ do_doctor() {
     bad "Plex does not answer on 127.0.0.1:32400"; problems=$((problems+1))
   fi
 
+  # Plex may be reachable while a library points at the wrong directory. Show its actual
+  # section roots next to Mwatcher's expected media root before diagnosing any .strm file.
+  hdr "2b. Plex library folders"
+  if [ -f "$REPO_DIR/scripts/plex_setup.py" ] && have python3; then
+    local section_report
+    if section_report="$(python3 "$REPO_DIR/scripts/plex_setup.py" \
+         --media-dir "$MEDIA_DIR" --sections --no-color 2>&1)"; then
+      printf '%s\n' "$section_report" | sed 's/^/  /'
+      if ! printf '%s\n' "$section_report" | grep -Fq "$MEDIA_DIR"; then
+        warn "No listed Plex folder contains the expected media root $MEDIA_DIR.
+       This alone can explain an empty library. Correct the section folders, then scan."
+      else
+        ok "Plex lists a folder under the expected media root $MEDIA_DIR"
+      fi
+    else
+      warn "could not read Plex library folders; run:
+       sudo python3 $REPO_DIR/scripts/plex_setup.py --media-dir $MEDIA_DIR --sections"
+      [ -z "$section_report" ] || printf '%s\n' "$section_report" | sed 's/^/  /'
+    fi
+  else
+    warn "plex_setup.py is unavailable; cannot inspect Plex's actual library folders"
+  fi
+
   if [ -r "$PLEX_PREFS" ] || sudo test -r "$PLEX_PREFS" 2>/dev/null; then
     local prefs; prefs="$(sudo cat "$PLEX_PREFS" 2>/dev/null || cat "$PLEX_PREFS" 2>/dev/null || true)"
     if [ -n "$prefs" ]; then
@@ -571,7 +594,7 @@ do_doctor() {
           *127.0.0.1*|*localhost*)
             bad "A custom URL points at 127.0.0.1/localhost. A phone/TV outside the server
        cannot reach that — browsing works but playback fails with s1001.
-       Use the LAN IP (e.g. http://192.168.0.34:32400) and/or your public hostname."
+       Use the LAN IP (e.g. http://192.168.0.200:32400) and/or your public hostname."
             problems=$((problems+1));;
         esac
         # first entry should be the LAN one so local clients do not hairpin
@@ -613,9 +636,9 @@ do_doctor() {
       ext="${f##*.}"
       printf '\n  %s%s%s  (%s bytes)\n' "$B" "$f" "$R" "$(numfmt --to=iec "$size" 2>/dev/null || echo "$size")"
 
-      # .strm = a text pointer. This is a SUPPORTED mode (play-through: the bridge scrapes
-      # a fresh link at play time and streams it, so nothing is downloaded). It only goes
-      # wrong when the CLIENT cannot reach the URL inside -- which is what s1001 means.
+      # .strm = a text pointer. Mwatcher can validate its URL and the bridge key, but Plex's
+      # ability to index/play it is server/client-dependent. Do not infer player compatibility
+      # from a healthy bridge response; the exact Plex app must be tested.
       if [ "$ext" = "strm" ]; then
         local target; target="$(head -c 500 "$f" | tr -d '\r\n')"
         info ".strm pointer → $target"
@@ -632,19 +655,13 @@ do_doctor() {
               problems=$((problems+1))
               ;;
             *)
-              bad "  this is a .strm pointer, and PLEX CANNOT PLAY .strm FILES.
-       Plex dropped .strm support years ago. Depending on version the scanner either
-       ignores the file (your library shows as EMPTY) or indexes it and then fails to
-       play it with s1001, because a 46-byte text file is not a video. Emby, Jellyfin
-       and Kodi do support .strm; Plex does not. This is not a misconfiguration -- no
-       firewall, bind address or permission change can make Plex play one.
-       Fix: add the title as a real download instead:
-         curl -X POST localhost:$BRIDGE_PORT/add -H 'Content-Type: application/json' \\
-           -d '{"title":"TITLE","year":YYYY,"action":"stream"}'
-       and make that the default:
-         sudo sed -i 's/^TELESTREAM_ACTION=.*/TELESTREAM_ACTION=stream/' $CONFIG_DIR/bridge.env
-         sudo systemctl restart mwatcher-bridge"
-              problems=$((problems+1))
+              warn "  Bridge URL is valid, but that does not prove this Plex server/client can
+       index or play a .strm file. Plex behavior is inconsistent: some combinations have
+       been reported to work (including some Android/Android TV clients), while others
+       ignore the file or fail. The HEAD test below verifies only the bridge/key, not the
+       Plex scanner or player. If the library is empty, check the actual folders in doctor
+       section 2b. Reliable playback across Plex clients requires a real video file; that
+       means a download. Keep .strm only if your exact Plex apps have been tested."
               local tpath code code2
               tpath="$(printf '%s' "$target" | sed -E 's#^[a-zA-Z]+://[^/]+##')"
               # Probe with HEAD, never GET. A GET on /play/<key> makes the bridge scrape a
@@ -1079,17 +1096,17 @@ EOF
 
   # ---- 5b. play-through must be reachable from clients, not just from here ---
   if pt_enabled; then
-    # This has to be said out loud, before anyone builds a library of pointers that cannot
-    # play. Plex dropped .strm support years ago: depending on version the scanner either
-    # ignores the file, so the library shows as EMPTY, or indexes it and then fails with
-    # s1001 because a 46-byte text file is not a video. No bind address, firewall rule or
-    # permission change fixes that -- it is the container, not the config.
-    bad "TELESTREAM_ACTION=strm is set, but PLEX CANNOT PLAY .strm FILES. Your library will
-     show as empty, or every title will fail with s1001. Emby, Jellyfin and Kodi support
-     .strm; Plex dropped it years ago. Use real downloads instead:
-       sudo sed -i 's/^TELESTREAM_ACTION=.*/TELESTREAM_ACTION=stream/' $CONFIG_DIR/bridge.env
-       sudo systemctl restart mwatcher-bridge
-     Everything below still applies if you move to Emby/Jellyfin/Kodi."
+    # Keep this explicit: .strm support is not a reliable, cross-client Plex contract.
+    # Some Plex/server-client combinations are reported to index/play pointers; others do
+    # not. Mwatcher can serve the URL, but cannot add a missing scanner/player capability.
+    warn "TELESTREAM_ACTION=strm is enabled: Mwatcher writes URL pointers, not video files.
+     Plex .strm behavior varies by server version and client; some combinations reportedly
+     work, others ignore the file or fail. Test one title on the exact Plex apps you use.
+     If the library is empty, first check its folder paths with:
+       sudo bash $REPO_DIR/install.sh doctor
+     Guaranteed Plex playback across clients uses real media files (action=stream), which
+     consumes disk. Jellyfin/Emby/Kodi are alternatives when no permanent media download is
+     required. The bridge bind and URL checks below are still useful when .strm works."
     if bridge_lan_bound; then
       ok "bridge listens beyond loopback, as play-through needs"
     else

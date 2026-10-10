@@ -2,11 +2,13 @@
 
 Turn your **Stremio addons** into a **Plex** library.
 
-Plex has no addon system, so it can't play a remote stream the way Stremio does — it plays
-*files*. Mwatcher is the bridge: your addons (merged and ranked by
-[Fast Combo](https://github.com/AfzalAshraf/stremio-addons)) find the video, Mwatcher
-downloads the single best link into your Plex library, and Plex serves it to every client
-you own, anywhere in the world.
+Plex has no addon system. Mwatcher bridges your addons (merged and ranked by
+[Fast Combo](https://github.com/AfzalAshraf/stremio-addons)) to a Plex library in two modes:
+download a real media file for dependable Plex playback, or create a `.strm` URL pointer and
+stream through a capped cache. **Plex `.strm` behavior is inconsistent across server/client
+combinations**: some are reported to scan/play pointers, while others ignore or fail them.
+The pointer path must be tested with the exact Plex apps you use; it is not a promise that
+"any Plex device" will play it.
 
 ```text
 your Stremio addons ──▶ Fast Combo ──▶ Mwatcher bridge ──▶ staging ──▶ Plex library ──▶ any Plex app
@@ -171,18 +173,22 @@ python3 scripts/seerr_source.py --doctor --url http://127.0.0.1:5055 --api-key t
 | | **Play through**<br>`action=strm` | **Download**<br>`action=stream` | **Request**<br>`action=seerr` |
 |---|---|---|---|
 | What lands in the library | a 45-byte `.strm` pointer | the video file | nothing yet — Seerr queues it |
-| **Works in Plex?** | **NO — Plex cannot play `.strm`** | **yes** | **yes** |
+| **Works in Plex?** | **Varies by Plex server/client; test first** | **yes** | **yes** |
 | Who fetches the bytes | the bridge, at play time | the bridge, now | Radarr/Sonarr → qBittorrent |
 | Disk used | a capped cache (default 20 GB, evicts oldest) | the whole title, forever | the whole title, forever |
 | Debrid needed | no | only for torrent-only links (skipped) | **no** — torrents/NZBs fetch it |
 | Time to watching | seconds | as long as the download takes | as long as the download takes |
 | Survives link rot | links are re-scraped every play | no — re-fetch if a host dies | yes, the file is yours |
 
-Play-through is the "don't download anything" mode: Plex asks the bridge, the bridge scrapes
-a **fresh** link from your addons right then, opens it with whatever headers the host needs,
+Play-through is the "no permanent media download" mode. **It is Plex-client-dependent:**
+when the configured Plex server/client recognizes the `.strm`, the pointer leads playback to
+the bridge. The bridge scrapes a **fresh** link, opens it with whatever headers the host needs,
 and streams it through (Range-aware, so seeking works) into a capped cache. A host serving a
-captcha page is caught before the first byte reaches Plex and the next link is tried — the
-same protection the download path has.
+captcha page is caught before the first byte is committed and the next link is tried. This
+bridge behavior does not make a Plex scanner or app support `.strm`; test one title on each
+Plex app you intend to use. For dependable playback across Plex clients, use `action=stream`
+(real media file, disk required). Jellyfin, Emby and Kodi are alternatives if permanent media
+downloads are not acceptable.
 
 ```bash
 curl -X POST localhost:8889/add    -d '{"title":"Dune","year":2021}'   # pointer, 0 bytes
@@ -193,11 +199,13 @@ curl -s  localhost:8889/plays      # pointers + what is cached
 curl -s  localhost:8889/cache      # cache size vs cap
 ```
 
-> **Play-through does not work in Plex.** Plex dropped `.strm` support years ago, so a library
-> of pointers either shows as **empty** or fails with **s1001** — a 46-byte text file is not a
-> video, and no firewall, bind-address or permission change alters that. Use
-> `TELESTREAM_ACTION=stream` (real downloads) for Plex. `.strm` does work on **Emby, Jellyfin
-> and Kodi**, so the play-through path below is kept for those.
+> **Plex `.strm` compatibility is inconsistent.** Some Plex server/client combinations are
+> reported to scan and play `.strm` pointers; others ignore them or fail (reports differ by
+> client, including Android/Android TV versus web/Apple). The bridge can verify the pointer URL
+> and serve its key, but cannot verify that Plex's scanner/player supports the format. Test the
+> exact Plex apps you use before relying on this mode. For dependable playback across Plex
+> clients, use `TELESTREAM_ACTION=stream` (real media files, disk required). `.strm` has more
+> consistent support in **Emby, Jellyfin and Kodi**.
 
 `TELESTREAM_ACTION=strm` makes play-through the default, and `SEERR_MODE=both` makes every
 fetch also create a Seerr request. `TELESTREAM_PUBLIC_BASE_URL` is the address written into
