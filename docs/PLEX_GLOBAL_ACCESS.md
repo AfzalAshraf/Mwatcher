@@ -38,12 +38,30 @@ password or addon list that already exists — so running it again repairs rathe
 
 ```bash
 cd ~/Mwatcher
-sudo bash install.sh
+sudo bash install.sh auto
 ```
 
-It installs Plex + Node + ffmpeg/yt-dlp, clones Fast Combo, creates `~/media/{Movies,TV Shows,staging}`,
-generates the keys (only if they do not exist yet), writes both systemd units with **your** paths and
-username, starts everything, and prints a status table plus the two URLs you need.
+It installs Plex + Node + ffmpeg/yt-dlp, adopts or clones Fast Combo, creates
+`~/media/{Movies,TV Shows,staging}`, reuses any key that already exists, writes both systemd units with
+**your** paths and username, and starts everything. Then it does §3 for you: it waits for you to sign in
+to Plex with Google, and once you have, it creates both libraries through the Plex API, turns on
+automatic scanning and verifies the result. Signing in is the only manual step — it prints a URL, you
+open it on any device on your network, and the rest finishes on its own.
+
+Headless over SSH, with no browser on the network:
+
+```bash
+sudo bash install.sh auto --claim-token claim-XXXXXXXX    # from https://plex.tv/claim, valid ~5 min
+```
+
+Plain `sudo bash install.sh` does the same install and stops before the Plex side, if you would rather
+click through §3 yourself.
+
+The library creation is not guesswork. Plex rejects a scanner/agent pair that does not belong together
+(`'agent' is missing or invalid … new scanner needs to be paired with new agent`), and the valid names
+have changed between versions, so `scripts/plex_setup.py` asks the running server what it supports via
+`/system/library/agents` and `/system/library/scanners/<type>` and picks from that list. An existing
+library covering the same path is detected and left alone, so re-running never duplicates one.
 
 Other modes — you will use `doctor` a lot:
 

@@ -23,10 +23,12 @@ your Stremio addons ──▶ Fast Combo ──▶ Mwatcher bridge ──▶ sta
 | Path | What it is |
 |---|---|
 | `docs/PLEX_GLOBAL_ACCESS.md` | **The full guide** — installing Plex on Lubuntu, running Fast Combo + the bridge, how the "best stream" is chosen, and reaching it all from anywhere (port forwarding, Cloudflare Tunnel, Tailscale/CGNAT) |
-| `install.sh` | **One command** to install/repair everything, plus `status`, `doctor` (diagnoses playback failures), `seerr` and `uninstall` |
+| `install.sh` | **One command** — `auto` installs everything *and* finishes the Plex side after you sign in; plus `status`, `doctor` (diagnoses playback failures), `seerr` and `uninstall` |
 | `scripts/telestream_to_plex.py` | The bridge: dashboard + HTTP API + CLI. Resolve → download **or** stream through a cache → name → library |
 | `scripts/stremio_source.py` | Fast Combo / Cinemeta client: parses and ranks addon streams, picks the best |
 | `scripts/seerr_source.py` | Seerr client: search → TMDB id → create a request, plus `--doctor` for the request path |
+| `scripts/plex_setup.py` | Plex automation: waits for your Google sign-in, creates both libraries via the API, enables auto-scan, verifies |
+| `demo/fake_plex.py` | A pretend Plex Media Server, strict about the things real Plex is strict about, so the above is testable with no Plex install |
 | `services/seerr-stack/docker-compose.yml` | Seerr + Radarr + Sonarr + Prowlarr + qBittorrent, all sharing one media path |
 | `services/fastcombo.service` | Runs your addons (Fast Combo) on `127.0.0.1:7000` |
 | `services/fastcombo-tunnel.service.example` | Keeps an SSH tunnel to a **remote** Fast Combo alive, so the access key never crosses a public interface |
@@ -40,13 +42,25 @@ your Stremio addons ──▶ Fast Combo ──▶ Mwatcher bridge ──▶ sta
 
 ```bash
 cd ~/Mwatcher
-sudo bash install.sh
+sudo bash install.sh auto
 ```
 
-That installs Plex, Node, ffmpeg/yt-dlp and Fast Combo, creates your library folders, generates the
-access keys (only if they don't already exist), writes both systemd units with your real paths, starts
-everything, and prints the two URLs you need. **It is safe to re-run** — it repairs instead of resetting,
-and never overwrites an existing key, password or addon list.
+That does everything: installs Plex, Node, ffmpeg/yt-dlp and Fast Combo, creates your library folders,
+reuses any access key that already exists, writes both systemd units with your real paths, starts
+everything — then **waits for you to sign in to Plex with Google** and finishes the rest by itself:
+both libraries created through the Plex API, automatic scanning on, and a verification pass.
+
+The sign-in is the only manual step. It prints a URL; open it on any device on your network, sign in,
+and walk away. On a headless box over SSH, use a claim token instead:
+
+```bash
+sudo bash install.sh auto --claim-token claim-XXXXXXXX    # from https://plex.tv/claim, valid ~5 min
+```
+
+Prefer to do the Plex clicking yourself? Plain `sudo bash install.sh` installs and stops there.
+
+**Both are safe to re-run** — they repair instead of resetting, never overwrite an existing key,
+password or addon list, and never duplicate a library.
 
 ```bash
 sudo bash install.sh status                  # what's installed and running? changes nothing

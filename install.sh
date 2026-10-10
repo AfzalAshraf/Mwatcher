@@ -43,6 +43,7 @@ case ":$PATH:" in
   *) PATH="$RUN_HOME/.local/bin:$PATH"; export PATH ;;
 esac
 
+AUTO_MODE=""   # set by do_auto: suppresses the manual "Next steps" it is about to do for you
 FC_DIR="${FC_DIR:-$RUN_HOME/stremio-addons}"
 CONFIG_DIR="$RUN_HOME/.config/mwatcher"
 MEDIA_DIR="${MEDIA_DIR:-$RUN_HOME/media}"
@@ -1094,6 +1095,7 @@ EOF
 
   local fckey2
   fckey2="$(grep -E '^FC_ACCESS_KEY=' "$CONFIG_DIR/fastcombo.env" 2>/dev/null | head -1 | cut -d= -f2- || true)"
+  if [ -n "$AUTO_MODE" ]; then return 0; fi
   hdr "Next steps"
   cat <<EOF
   1. Add your addons to Fast Combo (each is live-tested before it is added):
@@ -1113,6 +1115,72 @@ EOF
 
   Anything won't play?   ${B}sudo bash $REPO_DIR/install.sh doctor "title"${R}
 EOF
+}
+
+# =============================================================================
+#  auto -- the "sit and relax" path. Installs everything, then waits for the one
+#          step only a human can do (sign in with Google) and finishes the Plex
+#          side by itself: claim detection, both libraries, auto-scan, verify.
+#
+#    sudo bash install.sh auto
+#    sudo bash install.sh auto --claim-token claim-XXXXXXXX     # headless / SSH
+# =============================================================================
+do_auto() {
+  need_root auto
+  local claim="" timeout="${PLEX_SIGNIN_TIMEOUT:-900}" pport="${PLEX_PORT:-32400}"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --claim-token)   claim="${2:-}"; shift 2 ;;
+      --claim-token=*) claim="${1#*=}"; shift ;;
+      --timeout)       timeout="${2:-900}"; shift 2 ;;
+      --timeout=*)     timeout="${1#*=}"; shift ;;
+      --plex-port)     pport="${2:-32400}"; shift 2 ;;
+      *) warn "ignoring unknown argument: $1"; shift ;;
+    esac
+  done
+  [ -n "$claim" ] || claim="${PLEX_CLAIM:-}"
+
+  hdr "Mwatcher automatic setup"
+  info "everything below is unattended except one thing: signing in to Plex with Google."
+  info "when it asks, open the URL on any device on your network and sign in. Then relax."
+
+  AUTO_MODE=1
+  do_install
+
+  local py="$REPO_DIR/scripts/plex_setup.py"
+  [ -f "$py" ] || die "missing $py"
+  have python3 || die "python3 is required for the Plex automation"
+
+  hdr "8. Plex sign-in, libraries and scan"
+  local args=(--base-url "http://127.0.0.1:$pport" --media-dir "$MEDIA_DIR" --timeout "$timeout")
+  [ -n "$claim" ] && args+=(--claim-token "$claim")
+  args+=(--wait-signin --libraries --verify)
+
+  local rc=0
+  python3 "$py" "${args[@]}" || rc=$?
+
+  hdr "Done"
+  if [ "$rc" = "0" ]; then
+    ok "Plex is signed in, both libraries exist, and automatic scanning is on"
+    printf '\n  %sOpen the dashboard and add something:%s\n' "$B$Y" "$R"
+    printf '    %shttp://%s:%s/%s\n' "$B" "$(lan_ip_cli)" "$BRIDGE_PORT" "$R"
+    printf '\n  or from a shell:\n'
+    printf "    %scurl -X POST localhost:%s/add -H 'Content-Type: application/json' -d '{\"title\":\"Dune\",\"year\":2021}'%s\\n" "$B" "$BRIDGE_PORT" "$R"
+    printf '\n  Anything will not play?  %ssudo bash %s/install.sh doctor "title"%s\n' "$B" "$REPO_DIR" "$R"
+  else
+    warn "the Plex side did not finish cleanly (exit $rc). Nothing is broken -- re-run just
+     that part any time, it is idempotent and will not touch your existing libraries:
+          ${B}sudo bash $REPO_DIR/install.sh auto${R}"
+    info "if it timed out waiting for sign-in, either open the URL it printed and sign in,
+     or use the headless route: get a token from https://plex.tv/claim (valid ~5 min) and run
+          ${B}sudo bash $REPO_DIR/install.sh auto --claim-token claim-XXXXXXXX${R}"
+  fi
+  return "$rc"
+}
+
+# This box's LAN address, for the closing summary. Never fatal.
+lan_ip_cli() {
+  ip route get 1.1.1.1 2>/dev/null | grep -o 'src [0-9.]*' | awk '{print $2}' | head -1 || true
 }
 
 do_uninstall() {
@@ -1294,6 +1362,12 @@ usage() {
   cat <<EOF
 Mwatcher installer
 
+  sudo bash install.sh auto               EVERYTHING: install, then wait for you to sign in
+                                          to Plex with Google, then create both libraries,
+                                          turn on automatic scanning and verify
+  sudo bash install.sh auto --claim-token claim-XXXX
+                                          the same, for a box with no browser: get the token
+                                          from https://plex.tv/claim (valid ~5 minutes)
   sudo bash install.sh                    install / repair, then show status
   sudo bash install.sh status             report only, change nothing
   sudo bash install.sh doctor [title]     diagnose playback problems (s1001 etc.)
@@ -1316,6 +1390,7 @@ EOF
 
 case "${1:-install}" in
   install|"")  do_install ;;
+  auto)        shift; do_auto "$@" ;;
   status)      do_status ;;
   doctor)      shift; do_doctor "${1:-}" ;;
   seerr)       do_seerr ;;

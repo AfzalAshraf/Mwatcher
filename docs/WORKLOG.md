@@ -102,6 +102,8 @@ which *is* error s1001. Read the first `CHUNK`, run `sniff_html()` plus a
 | `ERR` trap | fires on an injected failure naming line + command; silent on success |
 | `bridge.env` repair | key appended when absent · corrected when wrong · no-op on re-run · 664 → 600 |
 | play-through reachability | 12 helper checks + 4 end-to-end: bind widened, LAN IP derived, idempotent, untouched when off |
+| `plex_setup.py` vs `demo/fake_plex.py` | claim → libraries → scan → verify, all green; idempotent re-run; not-signed-in fails cleanly; agent-worded 400 surfaces Plex's real sentence *and* the restart hint; language-worded 400 surfaces the sentence and suppresses the hint |
+| `install.sh auto` | end-to-end against the fake Plex, exit 0; unknown args warned and ignored; `AUTO_MODE` suppresses the manual Next-steps block |
 
 ### Adopting an existing Fast Combo (layout C — all on the VPS)
 
@@ -238,7 +240,17 @@ bogus `/play/deadbeef00.mkv` → 404 · `status`/`doctor`/`--help` exit 0.
     derives the LAN address if unset. `EnvironmentFile=` comes *after* `Environment=` in the
     unit, so writing `BRIDGE_HOST` into `bridge.env` overrides it and survives the unit being
     rewritten — no `override.conf` needed.
-19. **Test fixtures that share a scratch directory must not clean each other's.** Two
+19. **`printf '%s' "'{\"title\":\"Dune\"}'"` eats the quotes.** Inside a double-quoted bash
+    argument, `\"` becomes `"`, which then terminates the surrounding double-quoted string, so
+    the printed curl example came out as `-d '{title:Dune,year:2021}'` — a command the user
+    would paste and get a 400 from. Whole example on one `printf` with the format string
+    double-quoted and the JSON escaped once, not twice.
+20. **`global X` must precede any read of `X` in that function**, including a read in an
+    `argparse` default — otherwise `SyntaxError: name 'X' is used prior to global declaration`.
+21. **`and` binds tighter than `or`.** `if problems and "agent" in e or "scanner" in e:` parsed
+    as `(problems and "agent" in e) or ("scanner" in e)`, so the restart hint would have fired
+    on any error mentioning a scanner even with zero problems. Parenthesise.
+22. **Test fixtures that share a scratch directory must not clean each other's.** Two
     regression scripts both used `/tmp/fc`; the second deleted it on entry, so the first
     "failed" when run afterwards. Ordering artefacts look exactly like regressions — run each
     suite in isolation before believing a failure.
