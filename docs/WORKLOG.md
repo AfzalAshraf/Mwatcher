@@ -351,7 +351,23 @@ bogus `/play/deadbeef00.mkv` → 404 · `status`/`doctor`/`--help` exit 0.
     in ~9 ms without touching the network, and its status is *more* informative: 200 live,
     404 orphaned, 000 unreachable. Note the old curl-exit test was wrong in both directions
     -- it also read a 502 as reachable, since curl without `-f` exits 0 on an error status.
-39. **Test fixtures that share a scratch directory must not clean each other's.** Two
+39. **PLEX CANNOT PLAY `.strm` FILES AT ALL.** The single most expensive mistake in this
+    project: an entire play-through feature — `/play/<key>`, `/add`, the persisted play table,
+    `--repoint`, LAN binding, firewall rules, doctor checks — was built and debugged for weeks
+    on a container that has not supported the format since roughly 2018. Plex's scanner either
+    ignores `.strm` (library shows EMPTY) or indexes it and fails with s1001, because a
+    46-byte text file has no video stream. **The s1001 research already said the top cause is
+    "the file is not a video file" and that was the answer the whole time.** Sources: Plex
+    forum feature-request thread "[REQ] ADD STRM Support" (2018, still open), r/PleX ".strm
+    file support" (2018: "Plex removed support for strm files... plex still sees the file and
+    gives you false hope"), Channels community (2020: "plex used to work with *.Strm but
+    stopped support about a few years back"), rdt-client #76 (2021: "Kodi, Emby, Jellyfin
+    (not Plex!)"), firecore/Infuse (2025: "Plex itself doesn't support streaming .strm
+    files"), archive-movie-browser PR #375 (Sep 2026: "says Plex can't read .strm files").
+    Emby, Jellyfin and Kodi DO support it, so the code stays — but **verify the target
+    platform supports a format before building on it.** For Plex the working path is
+    `TELESTREAM_ACTION=stream`: download the real file.
+40. **Test fixtures that share a scratch directory must not clean each other's.** Two
     regression scripts both used `/tmp/fc`; the second deleted it on entry, so the first
     "failed" when run afterwards. Ordering artefacts look exactly like regressions — run each
     suite in isolation before believing a failure.

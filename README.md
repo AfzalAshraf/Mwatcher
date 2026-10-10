@@ -171,6 +171,7 @@ python3 scripts/seerr_source.py --doctor --url http://127.0.0.1:5055 --api-key t
 | | **Play through**<br>`action=strm` | **Download**<br>`action=stream` | **Request**<br>`action=seerr` |
 |---|---|---|---|
 | What lands in the library | a 45-byte `.strm` pointer | the video file | nothing yet — Seerr queues it |
+| **Works in Plex?** | **NO — Plex cannot play `.strm`** | **yes** | **yes** |
 | Who fetches the bytes | the bridge, at play time | the bridge, now | Radarr/Sonarr → qBittorrent |
 | Disk used | a capped cache (default 20 GB, evicts oldest) | the whole title, forever | the whole title, forever |
 | Debrid needed | no | only for torrent-only links (skipped) | **no** — torrents/NZBs fetch it |
@@ -191,6 +192,12 @@ curl -X POST localhost:8889/fetch  -d '{"title":"Dune","action":"both"}'  # watc
 curl -s  localhost:8889/plays      # pointers + what is cached
 curl -s  localhost:8889/cache      # cache size vs cap
 ```
+
+> **Play-through does not work in Plex.** Plex dropped `.strm` support years ago, so a library
+> of pointers either shows as **empty** or fails with **s1001** — a 46-byte text file is not a
+> video, and no firewall, bind-address or permission change alters that. Use
+> `TELESTREAM_ACTION=stream` (real downloads) for Plex. `.strm` does work on **Emby, Jellyfin
+> and Kodi**, so the play-through path below is kept for those.
 
 `TELESTREAM_ACTION=strm` makes play-through the default, and `SEERR_MODE=both` makes every
 fetch also create a Seerr request. `TELESTREAM_PUBLIC_BASE_URL` is the address written into

@@ -632,7 +632,19 @@ do_doctor() {
               problems=$((problems+1))
               ;;
             *)
-              ok "  play-through pointer — no downloaded file, that is intentional"
+              bad "  this is a .strm pointer, and PLEX CANNOT PLAY .strm FILES.
+       Plex dropped .strm support years ago. Depending on version the scanner either
+       ignores the file (your library shows as EMPTY) or indexes it and then fails to
+       play it with s1001, because a 46-byte text file is not a video. Emby, Jellyfin
+       and Kodi do support .strm; Plex does not. This is not a misconfiguration -- no
+       firewall, bind address or permission change can make Plex play one.
+       Fix: add the title as a real download instead:
+         curl -X POST localhost:$BRIDGE_PORT/add -H 'Content-Type: application/json' \\
+           -d '{"title":"TITLE","year":YYYY,"action":"stream"}'
+       and make that the default:
+         sudo sed -i 's/^TELESTREAM_ACTION=.*/TELESTREAM_ACTION=stream/' $CONFIG_DIR/bridge.env
+         sudo systemctl restart mwatcher-bridge"
+              problems=$((problems+1))
               local tpath code code2
               tpath="$(printf '%s' "$target" | sed -E 's#^[a-zA-Z]+://[^/]+##')"
               # Probe with HEAD, never GET. A GET on /play/<key> makes the bridge scrape a
@@ -1067,6 +1079,17 @@ EOF
 
   # ---- 5b. play-through must be reachable from clients, not just from here ---
   if pt_enabled; then
+    # This has to be said out loud, before anyone builds a library of pointers that cannot
+    # play. Plex dropped .strm support years ago: depending on version the scanner either
+    # ignores the file, so the library shows as EMPTY, or indexes it and then fails with
+    # s1001 because a 46-byte text file is not a video. No bind address, firewall rule or
+    # permission change fixes that -- it is the container, not the config.
+    bad "TELESTREAM_ACTION=strm is set, but PLEX CANNOT PLAY .strm FILES. Your library will
+     show as empty, or every title will fail with s1001. Emby, Jellyfin and Kodi support
+     .strm; Plex dropped it years ago. Use real downloads instead:
+       sudo sed -i 's/^TELESTREAM_ACTION=.*/TELESTREAM_ACTION=stream/' $CONFIG_DIR/bridge.env
+       sudo systemctl restart mwatcher-bridge
+     Everything below still applies if you move to Emby/Jellyfin/Kodi."
     if bridge_lan_bound; then
       ok "bridge listens beyond loopback, as play-through needs"
     else
