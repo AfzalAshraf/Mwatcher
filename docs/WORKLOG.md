@@ -111,6 +111,10 @@ which *is* error s1001. Read the first `CHUNK`, run `sniff_html()` plus a
 | claim when already signed in | exit 0 with "the claim token was not needed"; `do_auto` no longer trips the ERR trap |
 | `--repoint` | dry run lists 3 orphans and changes nothing; real run rebuilds 2, fails 1 with the reason, leaves a foreign `.strm` untouched; rebuilt keys stream `206` with `1a45dfa3` **through a restarted bridge** |
 | `parse_strm_path` | 5/5 including `Dune (2021)`, `Heart of the Beast (2026)`, `Drishyam The Conclusion (2026)`, `Breaking Bad - S01E02` |
+| `.strm.tmp` race | 4 concurrent `--action strm` adds of the same title: all succeed, exactly one `.strm`, zero stray `.tmp` (before: `[Errno 2] ... .strm.tmp`) |
+| Plex surgery | `--sections` lists ids and flags duplicate names; `--drop-location` reports without `--yes` and removes with it; dropping the last folder refuses and points at `--delete-section`; `--delete-section` refuses without `--yes` |
+| Plex unreachable | `--sections` says "not answering" instead of "no libraries" when the server is down |
+| CLI action default | `TELESTREAM_ACTION=strm` now makes the one-shot CLI write a pointer; it used to download a full file |
 
 ### Adopting an existing Fast Combo (layout C — all on the VPS)
 
@@ -298,7 +302,19 @@ bogus `/play/deadbeef00.mkv` → 404 · `status`/`doctor`/`--help` exit 0.
     to somewhere else is left alone), and re-adds any key that is gone. It recovers the title
     from the path we wrote, which is deterministic. If the recovered title produces a
     *different* path, the stale file is removed so Plex does not list two copies.
-29. **Test fixtures that share a scratch directory must not clean each other's.** Two
+29. **`tmp = path + ".tmp"` is a fixed name per title, so concurrent adds of the same
+    title race.** Two Dune adds in flight: the first `os.replace` moved the temp away and
+    the second died with `[Errno 2] No such file or directory: '...Dune (2021).strm.tmp'`,
+    reported as a failed job. Use a name unique per add (the play key already is) and
+    remove the temp on failure so Plex never scans a stray.
+30. **The CLI re-implemented `resolve_action()` and left out `TELESTREAM_ACTION`.** Its own
+    `--help` said "Default: TELESTREAM_ACTION", but a box configured for play-through still
+    downloaded a whole file when driven from a shell. Call the shared resolver instead of
+    restating the precedence in a second place.
+31. **"No libraries" and "Plex is unreachable" must not print the same thing.** Both surface
+    as an empty list, and telling someone their libraries are gone when the server is merely
+    down invites them to go and re-create things.
+32. **Test fixtures that share a scratch directory must not clean each other's.** Two
     regression scripts both used `/tmp/fc`; the second deleted it on entry, so the first
     "failed" when run afterwards. Ordering artefacts look exactly like regressions — run each
     suite in isolation before believing a failure.

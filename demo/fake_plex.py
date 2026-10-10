@@ -212,6 +212,22 @@ class Handler(BaseHTTPRequestHandler):
 
         return self._send(404, container(error=f"not found: {path}"))
 
+    # ---- DELETE -------------------------------------------------------------
+    def do_DELETE(self):
+        path, qs = self._route()
+        m = re.match(r"^/library/sections/([^/]+)$", path)
+        if m:
+            if not self._authed(qs):
+                return self._send(401, container(error="unauthorized"))
+            with LOCK:
+                before = len(STATE["sections"])
+                STATE["sections"] = [s for s in STATE["sections"]
+                                     if str(s.get("key")) != m.group(1)]
+                if len(STATE["sections"]) == before:
+                    return self._send(404, container(error="no such section"))
+            return self._send(200, container(size=0))
+        return self._send(404, container(error=f"not found: {path}"))
+
     # ---- PUT ----------------------------------------------------------------
     def do_PUT(self):
         path, qs = self._route()

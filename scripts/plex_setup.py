@@ -510,6 +510,153 @@ def do_libraries(token: str, language: str = "en-US", separate: bool = False) ->
 
 # ------------------------------------------------------------------------------- verify
 
+PLEX_TV_RESOURCES = "https://plex.tv/api/v2/resources?includeHttps=1"
+
+
+def require_server() -> bool:
+    """"No libraries" and "Plex is not reachable" must not look the same. Both come back as
+    an empty list, and telling someone their libraries are gone when the server is merely
+    down is the kind of message that gets acted on."""
+    if server_up():
+        return True
+    bad(f"Plex is not answering on {BASE} — is plexmediaserver running?")
+    info("sudo systemctl status plexmediaserver --no-pager")
+    return False
+
+
+def do_sections(token: str) -> int:
+    """List every library with its id and folders -- what you need before deleting one."""
+    hdr("Plex libraries (with the ids the delete calls need)")
+    if not require_server():
+        return 1
+    secs = sections(token)
+    if not secs:
+        warn("Plex is up but has no libraries")
+        return 0
+    titles: dict[str, int] = {}
+    for s in secs:
+        titles[str(s.get("title", "")).strip().lower()] = titles.get(
+            str(s.get("title", "")).strip().lower(), 0) + 1
+    for s in secs:
+        sid = s.get("key") or s.get("id")
+        title = str(s.get("title", "?"))
+        dup = titles.get(title.strip().lower(), 0) > 1
+        flag = "  <-- DUPLICATE NAME" if dup else ""
+        out("·", f"id {sid}  '{title}' ({s.get('type', '?')}){flag}", "b" if dup else "d")
+        for loc in s.get("Location") or []:
+            info(f"        {(loc or {}).get('path', '?')}")
+    if any(v > 1 for v in titles.values()):
+        warn("more than one library shares a name: Plex lists both and it is easy to play")
+        warn("the wrong one. Drop the stale folder or delete the stale library by id.")
+    return 0
+
+
+def do_drop_location(token: str, path: str, yes: bool) -> int:
+    """Remove one folder from whichever library contains it. Leaves the library itself."""
+    hdr(f"Drop the folder {path}")
+    if not require_server():
+        return 1
+    path = os.path.normpath(path)
+    secs = sections(token)
+    hits = [s for s in secs if any(os.path.normpath((l or {}).get("path", "")) == path
+                                  for l in (s.get("Location") or []))]
+    if not hits:
+        warn(f"no library contains {path} — nothing to do")
+        return 0
+    for s in hits:
+        sid = s.get("key") or s.get("id")
+        keep = [l for l in ((l or {}).get("path") for l in (s.get("Location") or []))
+                if l and os.path.normpath(l) != path]
+        if not keep:
+            warn(f"'{s.get('title')}' (id {sid}) would be left with NO folders")
+            info(f"delete the whole library instead:  --delete-section {sid} --yes")
+            continue
+        if not yes:
+            warn(f"would remove {path} from '{s.get('title')}' (id {sid}), leaving {keep}")
+            info("re-run with --yes to actually do it")
+            continue
+        good, detail = _set_locations(token, s, keep)
+        if good:
+            ok(f"removed {path} from '{s.get('title')}' ({detail})")
+        else:
+            bad(f"could not edit '{s.get('title')}': {detail}")
+            return 1
+    return 0
+
+
+def _set_locations(token: str, sec: dict, locs: list[str]) -> tuple[bool, str]:
+    sid = sec.get("key") or sec.get("id")
+    params = {"id": sid, "type": sec.get("type", ""), "title": sec.get("title", ""),
+              "agent": sec.get("agent", ""), "scanner": sec.get("scanner", ""),
+              "language": sec.get("language", "en-US"), "location": locs}
+    st, body = api(f"/library/sections/{sid}", token, method="PUT", timeout=30, params=params)
+    if st in (200, 201, 202):
+        return True, f"{len(locs)} folder(s) left"
+    return False, f"HTTP {st} {err_text(body)}".strip()
+
+
+def do_delete_section(token: str, sid: str, yes: bool) -> int:
+    """Delete a whole library. Does NOT touch the files on disk."""
+    if not require_server():
+        return 1
+    secs = sections(token)
+    sec = next((s for s in secs if str(s.get("key") or s.get("id")) == str(sid)), None)
+    if not sec:
+        bad(f"no library with id {sid}")
+        do_sections(token)
+        return 1
+    locs = [l.get("path", "?") for l in (sec.get("Location") or [])]
+    hdr(f"Delete library id {sid}")
+    out("·", f"'{sec.get('title')}' ({sec.get('type')}) containing:", "d")
+    for l in locs:
+        info(f"        {l}")
+    info("the files on disk are NOT deleted, only the library entry in Plex")
+    if not yes:
+        warn("this is destructive — re-run with --yes to actually do it")
+        return 0
+    st, body = api(f"/library/sections/{sid}", token, method="DELETE", timeout=30)
+    if st in (200, 202, 204):
+        ok(f"deleted library '{sec.get('title')}' (id {sid})")
+        return 0
+    bad(f"Plex refused (HTTP {st}) {err_text(body)}".rstrip())
+    return 1
+
+
+def do_servers(token: str) -> int:
+    """List the servers registered to your plex.tv account -- for 'why do I see two?'."""
+    hdr("Servers on your plex.tv account")
+    if not token:
+        bad("no token — this needs a signed-in server")
+        return 1
+    req = urllib.request.Request(PLEX_TV_RESOURCES)
+    req.add_header("Accept", "application/json")
+    req.add_header("X-Plex-Token", token)
+    try:
+        with urllib.request.urlopen(req, timeout=25) as r:
+            data = json.loads(r.read().decode("utf-8", "replace"))
+    except Exception as exc:
+        bad(f"could not reach plex.tv: {exc}")
+        info("this check needs outbound internet; the rest of this script does not")
+        return 1
+    mine = read_pref("ProcessedMachineIdentifier")
+    servers = [d for d in (data or []) if isinstance(d, dict)
+               and str(d.get("provides", "")).find("server") >= 0]
+    if not servers:
+        warn("plex.tv reports no servers on this account")
+        return 0
+    for d in servers:
+        here = " <-- THIS machine" if d.get("clientIdentifier") == mine else ""
+        ok(f"'{d.get('name', '?')}'  id {d.get('clientIdentifier', '?')[:16]}…{here}")
+        info(f"        owned={d.get('owned')}  sourceTitle={d.get('sourceTitle') or '-'}"
+             f"  connections={len(d.get('connections') or [])}")
+    if len(servers) > 1:
+        warn(f"{len(servers)} servers are registered to this account")
+        info("an old entry usually means a previous install or a container that is gone.")
+        info("remove it in Plex: Settings → Devices / Authorized Devices → delete.")
+        info("the one marked THIS machine is the one you want to keep.")
+    return 0
+
+
 def do_verify(token: str) -> int:
     hdr("Verify")
     problems = 0
@@ -553,6 +700,16 @@ def main() -> int:
                     help="create the Movies and TV Shows libraries, then scan them")
     ap.add_argument("--verify", action="store_true", help="report Plex's actual state")
     ap.add_argument("--language", default=os.environ.get("PLEX_LANG", "en-US"))
+    ap.add_argument("--sections", action="store_true",
+                    help="list every library with its id and folders")
+    ap.add_argument("--drop-location", metavar="PATH",
+                    help="remove one folder from whichever library contains it")
+    ap.add_argument("--delete-section", metavar="ID",
+                    help="delete a whole library by id (files on disk are untouched)")
+    ap.add_argument("--servers", action="store_true",
+                    help="list the servers registered to your plex.tv account")
+    ap.add_argument("--yes", action="store_true",
+                    help="actually perform --drop-location / --delete-section")
     ap.add_argument("--separate-libraries", action="store_true",
                     help="create new sections even when one of the same name already exists")
     ap.add_argument("--timeout", type=int, default=SIGNIN_TIMEOUT)
@@ -586,10 +743,19 @@ def main() -> int:
 
     if a.libraries:
         rc += do_libraries(token, a.language, separate=a.separate_libraries)
+    if a.sections:
+        rc += do_sections(token)
+    if a.drop_location:
+        rc += do_drop_location(token, a.drop_location, a.yes)
+    if a.delete_section:
+        rc += do_delete_section(token, a.delete_section, a.yes)
+    if a.servers:
+        rc += do_servers(token)
     if a.verify:
         rc += do_verify(token)
 
-    if not (a.claim_token or a.wait_signin or a.libraries or a.verify):
+    if not (a.claim_token or a.wait_signin or a.libraries or a.verify or a.sections
+            or a.drop_location or a.delete_section or a.servers):
         ap.print_help()
     return 1 if rc else 0
 

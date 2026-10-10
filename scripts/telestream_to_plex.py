@@ -815,11 +815,22 @@ def add_strm(payload: dict) -> dict:
     root = override or play_base_url()
     url = f"{root}/play/{key}.mkv"
     path = os.path.join(target_dir, base + ".strm")
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as handle:
-        handle.write(url + "\n")
-    os.chmod(tmp, 0o644)                     # the plex user must be able to read it
-    os.replace(tmp, path)
+    # The temp name has to be unique per add, not per title. Two adds of the same title at
+    # once (easy: two dashboard clicks, or a re-run while one is in flight) used to share
+    # "<Title>.strm.tmp"; the first os.replace moved it away and the second died with
+    # [Errno 2] No such file or directory: '...strm.tmp'. The key is already random.
+    tmp = f"{path}.{key}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            handle.write(url + "\n")
+        os.chmod(tmp, 0o644)                 # the plex user must be able to read it
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.remove(tmp)                   # never leave a stray .tmp for Plex to scan
+        except OSError:
+            pass
+        raise
     log(f"strm: {path} -> {url} ({len(candidates)} live candidate link(s))")
     return {
         "key": key, "strm": path, "play_url": url, "title": title, "year": year,
@@ -2019,8 +2030,10 @@ def main(argv: list[str]) -> int:
 
     if args.add:
         args.action = "strm"
-    want_action = (args.action or "").strip().lower() or (
-        "seerr" if SEERR_MODE == "request" else "both" if SEERR_MODE == "both" else "stream")
+    # Use the shared resolver. This line used to re-implement it and left out
+    # TELESTREAM_ACTION entirely, so a box configured for play-through still downloaded a
+    # full file when you used the CLI -- while --help promised "Default: TELESTREAM_ACTION".
+    want_action = resolve_action({}, args.action or "")
     if stremio_source is None and not (args.url or args.stream) and want_action != "seerr":
         parser.error("stremio_source.py is missing, so only --url/--stream mode is available")
 
