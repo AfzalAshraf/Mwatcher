@@ -109,6 +109,8 @@ which *is* error s1001. Read the first `CHUNK`, run `sniff_html()` plus a
 | play-table persistence | keys survive a fresh process; reloaded at import; a CLI `--add` merges (2 → 3) instead of overwriting |
 | duplicate libraries | joins the existing section (2 folders, no duplicate names), warns about the old path, idempotent on re-run, `--separate-libraries` still creates a second one |
 | claim when already signed in | exit 0 with "the claim token was not needed"; `do_auto` no longer trips the ERR trap |
+| `--repoint` | dry run lists 3 orphans and changes nothing; real run rebuilds 2, fails 1 with the reason, leaves a foreign `.strm` untouched; rebuilt keys stream `206` with `1a45dfa3` **through a restarted bridge** |
+| `parse_strm_path` | 5/5 including `Dune (2021)`, `Heart of the Beast (2026)`, `Drishyam The Conclusion (2026)`, `Breaking Bad - S01E02` |
 
 ### Adopting an existing Fast Combo (layout C — all on the VPS)
 
@@ -289,7 +291,14 @@ bogus `/play/deadbeef00.mkv` → 404 · `status`/`doctor`/`--help` exit 0.
     /library/sections/<id>` now joins the existing section, sending existing paths *plus* the
     new one because PUT replaces the whole list. `--separate-libraries` restores the old
     behaviour.
-28. **Test fixtures that share a scratch directory must not clean each other's.** Two
+28. **Persisting a table is only half the fix — the pointers already written are still dead.**
+    After adding persistence, every `.strm` created before it points at a key that was never
+    saved. Nothing on disk distinguishes those from healthy ones, so `--repoint` walks the
+    library, keeps only pointers aimed at this bridge's `/play/<key>` (a hand-written `.strm`
+    to somewhere else is left alone), and re-adds any key that is gone. It recovers the title
+    from the path we wrote, which is deterministic. If the recovered title produces a
+    *different* path, the stale file is removed so Plex does not list two copies.
+29. **Test fixtures that share a scratch directory must not clean each other's.** Two
     regression scripts both used `/tmp/fc`; the second deleted it on entry, so the first
     "failed" when run afterwards. Ordering artefacts look exactly like regressions — run each
     suite in isolation before believing a failure.

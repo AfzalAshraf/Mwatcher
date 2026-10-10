@@ -686,6 +686,108 @@ def play_list() -> list[dict]:
     return sorted(out, key=lambda d: d["created"], reverse=True)
 
 
+STRM_TARGET_RE = re.compile(r"/play/([0-9a-fA-F]{6,40})\.(?:mkv|mp4|webm|avi)$")
+MOVIE_NAME_RE = re.compile(r"^(?P<title>.+?)\s*\((?P<year>\d{4})\)$")
+EPISODE_NAME_RE = re.compile(r"^(?P<show>.+?)\s*-\s*S(?P<season>\d{1,2})E(?P<episode>\d{1,3})$",
+                             re.IGNORECASE)
+
+
+def parse_strm_path(path: str) -> dict:
+    """Recover what a pointer was for, from the library path this bridge wrote it to.
+
+    The naming is ours and deterministic, so this is reliable for anything we created:
+        Movies/<Title> (<Year>)/<Title> (<Year>).strm
+        TV Shows/<Show>/Season 01/<Show> - S01E02.strm
+    """
+    name = os.path.splitext(os.path.basename(path))[0]
+    parent = os.path.basename(os.path.dirname(path))
+    m = EPISODE_NAME_RE.match(name)
+    if m:
+        return {"title": m.group("show").strip(), "kind": "show", "year": "", "imdb": "",
+                "episode": f"S{int(m.group('season')):02d}E{int(m.group('episode')):02d}"}
+    m = MOVIE_NAME_RE.match(name)
+    if m:
+        return {"title": m.group("title").strip(), "kind": "movie", "year": m.group("year"),
+                "imdb": "", "episode": ""}
+    if parent.lower().startswith("season"):
+        # An episode file whose name we do not recognise: the show folder still tells us.
+        show = os.path.basename(os.path.dirname(os.path.dirname(path)))
+        return {"title": show, "kind": "show", "year": "", "imdb": "", "episode": ""}
+    return {"title": name, "kind": "movie", "year": "", "imdb": "", "episode": ""}
+
+
+def repoint_library(dry_run: bool = False) -> int:
+    """Re-create every play-through pointer whose key this bridge no longer knows.
+
+    Pointers written before the play table was persisted are orphaned: the .strm looks
+    perfectly healthy, Plex asks for it, and gets a 404. Nothing on disk says which are
+    dead, so walk the library, keep the ones pointing at us, and re-add any whose key is
+    gone. Re-adding writes a fresh .strm with a key that will now survive a restart.
+    """
+    mine: list[str] = []
+    dead: list[str] = []
+    fixed, failed, skipped = 0, 0, []
+    for root_dir in (MOVIES_DIR, TV_DIR):
+        if not os.path.isdir(root_dir):
+            continue
+        for dirpath, _dirnames, filenames in os.walk(root_dir):
+            for fn in sorted(filenames):
+                if not fn.lower().endswith(".strm"):
+                    continue
+                path = os.path.join(dirpath, fn)
+                try:
+                    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                        target = fh.read(600).strip()
+                except OSError:
+                    skipped.append(path)
+                    continue
+                m = STRM_TARGET_RE.search(target)
+                if not m:
+                    continue                     # a hand-written pointer to somewhere else
+                mine.append(path)
+                key = m.group(1)
+                with PLAY_LOCK:
+                    known = key in PLAY
+                if known:
+                    continue
+                dead.append(path)
+                if dry_run:
+                    continue
+                payload = parse_strm_path(path)
+                try:
+                    res = add_strm(payload)
+                except Exception as exc:         # noqa: BLE001 - report and carry on
+                    failed += 1
+                    log(f"repoint FAILED {path}: {exc}")
+                    continue
+                fixed += 1
+                new_path = res.get("strm") or ""
+                log(f"repointed {payload.get('title')}: {key} -> {res.get('key')}")
+                # If the recovered title produced a different path, the old file is a stray
+                # duplicate that Plex would still list. Remove it.
+                if new_path and os.path.abspath(new_path) != os.path.abspath(path):
+                    try:
+                        os.remove(path)
+                        log(f"  removed the stale pointer {path}")
+                    except OSError:
+                        warn = f"  could not remove the stale pointer {path}"
+                        log(warn)
+    report = {
+        "play_file": PLAY_FILE,
+        "known_keys": len(PLAY),
+        "strm_files_pointing_at_this_bridge": len(mine),
+        "orphaned": len(dead),
+        "recreated": fixed,
+        "failed": failed,
+        "unreadable": len(skipped),
+        "dry_run": dry_run,
+    }
+    if dead:
+        report["orphaned_paths"] = dead[:50]
+    print(json.dumps(report, indent=2))
+    return 1 if failed else 0
+
+
 def add_strm(payload: dict) -> dict:
     """
     Put a title in the library WITHOUT downloading it: resolve once now (so a title with
@@ -1880,6 +1982,13 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--url", help="direct/Telestream stream URL instead of an addon lookup")
     parser.add_argument("--stream", help="same as --url but skip the local resolver")
     parser.add_argument("--dest", help="override destination folder (skips Plex naming rules)")
+    # repair: pointers written before the play table was persisted point at keys nothing
+    # knows about any more, and Plex 404s on them
+    parser.add_argument("--repoint", action="store_true",
+                        help="re-create every play-through .strm whose key this bridge no "
+                             "longer knows, then report what it did")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="with --repoint: list the orphaned pointers, change nothing")
     # Seerr: request a title so Radarr/Sonarr download it to your server
     parser.add_argument("--action", choices=list(ACTIONS),
                         help="stream (download the best addon stream), strm (NO download: "
@@ -1905,6 +2014,9 @@ def main(argv: list[str]) -> int:
     if args.serve == "serve":
         serve()
         return 0
+    if args.repoint:
+        return repoint_library(dry_run=args.dry_run)
+
     if args.add:
         args.action = "strm"
     want_action = (args.action or "").strip().lower() or (
