@@ -215,6 +215,23 @@ class Handler(BaseHTTPRequestHandler):
     # ---- PUT ----------------------------------------------------------------
     def do_PUT(self):
         path, qs = self._route()
+        m = re.match(r"^/library/sections/([^/]+)$", path)
+        if m:
+            if not self._authed(qs):
+                return self._send(401, container(error="unauthorized"))
+            with LOCK:
+                for sec in STATE["sections"]:
+                    if str(sec.get("key")) != m.group(1):
+                        continue
+                    locs = qs.get("location") or []
+                    if locs:
+                        sec["Location"] = [{"id": i + 1, "path": p} for i, p in enumerate(locs)]
+                    for field in ("title", "agent", "scanner", "language", "type"):
+                        if qs.get(field):
+                            sec[field] = qs[field][0]
+                    return self._send(200, container(size=1, Directory=[sec]))
+            return self._send(404, container(error="no such section"))
+
         if path == "/:/prefs":
             if not self._authed(qs):
                 return self._send(401, container(error="unauthorized"))

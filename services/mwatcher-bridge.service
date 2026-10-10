@@ -112,6 +112,9 @@ EnvironmentFile=/home/afine/.config/mwatcher/bridge.env
 #Environment=TELESTREAM_CACHE_MAX_GB=20
 #Environment=TELESTREAM_CACHE=1
 #Environment=TELESTREAM_RESOLVE_TTL=300
+# Where the play-through table is kept. It has to outlive the process: without it a restart
+# orphans every .strm already in the library, and Plex 404s on a pointer that looks valid.
+#Environment=TELESTREAM_PLAY_FILE=/home/afine/.local/share/mwatcher/plays.json
 #Environment=TELESTREAM_PLAY_TIMEOUT=30
 
 # --- verifying downloads --------------------------------------------------------------

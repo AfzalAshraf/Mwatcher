@@ -43,6 +43,7 @@ case ":$PATH:" in
   *) PATH="$RUN_HOME/.local/bin:$PATH"; export PATH ;;
 esac
 
+AUTO_RC=0      # do_auto's real exit status, kept out of the ERR trap's way
 AUTO_MODE=""   # set by do_auto: suppresses the manual "Next steps" it is about to do for you
 FC_DIR="${FC_DIR:-$RUN_HOME/stremio-addons}"
 CONFIG_DIR="$RUN_HOME/.config/mwatcher"
@@ -1170,14 +1171,19 @@ do_auto() {
     printf "    %scurl -X POST localhost:%s/add -H 'Content-Type: application/json' -d '{\"title\":\"Dune\",\"year\":2021}'%s\\n" "$B" "$BRIDGE_PORT" "$R"
     printf '\n  Anything will not play?  %ssudo bash %s/install.sh doctor "title"%s\n' "$B" "$REPO_DIR" "$R"
   else
-    warn "the Plex side did not finish cleanly (exit $rc). Nothing is broken -- re-run just
-     that part any time, it is idempotent and will not touch your existing libraries:
+    warn "the Plex side did not finish cleanly (exit $rc). The install itself is complete and
+     nothing is broken -- re-run just that part any time; it is idempotent and will not touch
+     your existing libraries:
           ${B}sudo bash $REPO_DIR/install.sh auto${R}"
     info "if it timed out waiting for sign-in, either open the URL it printed and sign in,
      or use the headless route: get a token from https://plex.tv/claim (valid ~5 min) and run
           ${B}sudo bash $REPO_DIR/install.sh auto --claim-token claim-XXXXXXXX${R}"
   fi
-  return "$rc"
+  # Deliberately return 0: a non-zero `return` is a failing command under set -e, so the ERR
+  # trap fires and prints "the install is INCOMPLETE" over an install that finished fine. The
+  # real status travels in AUTO_RC and the dispatcher exits with it.
+  AUTO_RC="$rc"
+  return 0
 }
 
 # This box's LAN address, for the closing summary. Never fatal.
@@ -1392,7 +1398,7 @@ EOF
 
 case "${1:-install}" in
   install|"")  do_install ;;
-  auto)        shift; do_auto "$@" ;;
+  auto)        shift; do_auto "$@"; exit "$AUTO_RC" ;;
   status)      do_status ;;
   doctor)      shift; do_doctor "${1:-}" ;;
   seerr)       do_seerr ;;

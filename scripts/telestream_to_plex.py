@@ -473,6 +473,14 @@ PLAY: dict[str, dict] = {}
 PLAY_LOCK = threading.Lock()
 MAX_PLAYS = int(os.environ.get("TELESTREAM_MAX_PLAYS", "500"))
 
+# The play table MUST survive a restart, and it did not. Keys are random and used to live
+# only in RAM, so a reboot -- or the `systemctl restart mwatcher-bridge` that the installer
+# itself tells you to run -- orphaned every .strm already sitting in the library. Plex then
+# gets a 404 from a pointer that looks perfectly valid, which presents exactly like s1001.
+PLAY_FILE = os.environ.get(
+    "TELESTREAM_PLAY_FILE",
+    os.path.join(os.path.expanduser("~"), ".local", "share", "mwatcher", "plays.json"))
+
 CACHE_DIR = os.environ.get("TELESTREAM_CACHE_DIR", os.path.join(HOME, "media", "cache"))
 CACHE_MAX_BYTES = int(float(os.environ.get("TELESTREAM_CACHE_MAX_GB", "20")) * 1024 ** 3)
 CACHE_ENABLED = os.environ.get("TELESTREAM_CACHE", "1").lower() not in ("0", "false", "no")
@@ -507,6 +515,56 @@ def play_base_url() -> str:
     return f"http://{host}:{BRIDGE_PORT}"
 
 
+def play_save() -> None:
+    """Persist the play table atomically.
+
+    Candidates are deliberately NOT written: addon links expire within minutes, so the first
+    play after a restart re-scrapes anyway. Only the payload is needed to do that.
+    """
+    try:
+        with PLAY_LOCK:
+            data = {k: {"payload": e.get("payload") or {}, "created": e.get("created", 0),
+                        "hits": e.get("hits", 0)} for k, e in PLAY.items()}
+        parent = os.path.dirname(PLAY_FILE)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        tmp = PLAY_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"version": 1, "plays": data}, fh)
+        os.replace(tmp, PLAY_FILE)
+    except (OSError, TypeError, ValueError) as exc:
+        log(f"could not save the play table to {PLAY_FILE}: {exc}")
+
+
+def play_load() -> int:
+    """Restore the play table. Called at import, so a one-shot CLI run cannot overwrite the
+    table a running server depends on -- it adds to it instead."""
+    try:
+        with open(PLAY_FILE, "r", encoding="utf-8") as fh:
+            blob = json.load(fh)
+    except (OSError, ValueError):
+        return 0
+    plays = blob.get("plays") if isinstance(blob, dict) else None
+    if not isinstance(plays, dict):
+        return 0
+    restored = 0
+    with PLAY_LOCK:
+        for key, e in plays.items():
+            if not isinstance(e, dict) or not isinstance(e.get("payload"), dict):
+                continue
+            if key in PLAY:
+                continue
+            try:
+                created = float(e.get("created") or time.time())
+                hits = int(e.get("hits") or 0)
+            except (TypeError, ValueError):
+                created, hits = time.time(), 0
+            PLAY[key] = {"payload": e["payload"], "created": created, "resolved": 0.0,
+                         "candidates": [], "plan": {}, "hits": hits}
+            restored += 1
+    return restored
+
+
 def new_play_key(payload: dict) -> str:
     key = uuid.uuid4().hex[:10]
     with PLAY_LOCK:
@@ -515,6 +573,7 @@ def new_play_key(payload: dict) -> str:
         if len(PLAY) > MAX_PLAYS:
             for stale in sorted(PLAY, key=lambda k: PLAY[k]["created"])[: len(PLAY) - MAX_PLAYS]:
                 PLAY.pop(stale, None)
+    play_save()          # outside the lock: play_save takes it
     return key
 
 
@@ -639,6 +698,7 @@ def add_strm(payload: dict) -> dict:
     except Exception:
         with PLAY_LOCK:
             PLAY.pop(key, None)
+        play_save()
         raise
     entry = play_entry(key)
     plan = entry["plan"]
@@ -1576,7 +1636,14 @@ class Handler(BaseHTTPRequestHandler):
         try:
             play_entry(key)
         except KeyError:
-            self._send(404, {"error": f"unknown play key '{key}' -- create one with POST /add"})
+            self._send(404, {
+                "error": f"unknown play key '{key}'",
+                "detail": ("this pointer is not in the play table. Either it was never created "
+                           "by this bridge, or it was dropped by TELESTREAM_MAX_PLAYS. Re-add "
+                           "the title with POST /add and replace the .strm."),
+                "play_file": PLAY_FILE,
+                "known_plays": len(PLAY),
+            })
             return
         final = cache_path(key, True)
         if os.path.exists(final):
@@ -1769,12 +1836,22 @@ class Handler(BaseHTTPRequestHandler):
         log(f"{self.address_string()} {fmt % args}")
 
 
+# Restore pointers written by earlier runs. This happens at IMPORT, not inside serve(), so a
+# one-shot `--add` from a shell merges into the existing table instead of replacing it with a
+# single entry and silently killing every other .strm in the library.
+RESTORED_PLAYS = play_load()
+
+
 def serve() -> None:
     for directory in (STAGING, MOVIES_DIR, TV_DIR):
         os.makedirs(directory, exist_ok=True)
     httpd = ThreadingHTTPServer((BRIDGE_HOST, BRIDGE_PORT), Handler)
     log(f"listening on http://{BRIDGE_HOST}:{BRIDGE_PORT} (POST /fetch, GET /jobs)")
     log(f"staging={STAGING} movies={MOVIES_DIR} tv={TV_DIR}")
+    if RESTORED_PLAYS:
+        log(f"restored {RESTORED_PLAYS} play-through pointer(s) from {PLAY_FILE}")
+    else:
+        log(f"play-through table: {PLAY_FILE}")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

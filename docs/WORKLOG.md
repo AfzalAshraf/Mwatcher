@@ -106,6 +106,9 @@ which *is* error s1001. Read the first `CHUNK`, run `sniff_html()` plus a
 | `install.sh auto` | end-to-end against the fake Plex, exit 0; unknown args warned and ignored; `AUTO_MODE` suppresses the manual Next-steps block |
 | `envfile` + the CLI | the user's exact failing command now resolves and downloads with the key present **only** in `bridge.env`; an explicit env var still overrides it; spaces in `TELESTREAM_TV_DIR` preserved; matched quotes stripped from `TELESTREAM_DOWNLOAD_CMD` with its inner quoting intact; comments, `export `, and empty values handled |
 | `status` addon count | old expression yielded `0\|0\|` (two lines) under `pipefail`, new yields `0\|` |
+| play-table persistence | keys survive a fresh process; reloaded at import; a CLI `--add` merges (2 → 3) instead of overwriting |
+| duplicate libraries | joins the existing section (2 folders, no duplicate names), warns about the old path, idempotent on re-run, `--separate-libraries` still creates a second one |
+| claim when already signed in | exit 0 with "the claim token was not needed"; `do_auto` no longer trips the ERR trap |
 
 ### Adopting an existing Fast Combo (layout C — all on the VPS)
 
@@ -264,7 +267,29 @@ bogus `/play/deadbeef00.mkv` → 404 · `status`/`doctor`/`--help` exit 0.
     `wc` emits its own `0`, then pipefail fails the pipeline and `|| echo 0` adds a second
     line, so `${n:-0}` rendered a bare `0` on its own line in `status`. Wrap the grep in
     `{ grep … || true; }` instead of rescuing the pipeline.
-24. **Test fixtures that share a scratch directory must not clean each other's.** Two
+24. **The play-through table lived only in RAM, so every restart orphaned the library.**
+    Keys are random (`uuid4().hex[:10]`) and `PLAY` was a module-level dict, so a reboot — or
+    the `systemctl restart mwatcher-bridge` the installer itself recommends after editing
+    `bridge.env` — left every `.strm` pointing at a key nothing knew about. Plex gets a 404
+    from a pointer that looks perfectly valid, which is indistinguishable from s1001. Now
+    persisted atomically to `TELESTREAM_PLAY_FILE` and reloaded **at import**, so a one-shot
+    CLI `--add` merges into the table instead of replacing it with one entry. Candidates are
+    deliberately not saved: addon links expire in minutes, so the first play after a restart
+    re-scrapes, which is the behaviour you want.
+25. **`return "$rc"` with a non-zero rc trips the ERR trap.** `do_auto` finished a complete
+    install, returned 1 because a claim token was refused, and the trap printed "the install
+    is INCOMPLETE" over an install that was fine. Keep the real status in a global and let the
+    dispatcher `exit` with it.
+26. **Plex answers a claim token with 401 once it already belongs to an account.** That is the
+    outcome the caller wanted, not a failure — check `is_claimed()` first and say so.
+27. **Two libraries called "Movies" is worse than one library with two folders.** A previous
+    project on the same box had already created `Movies` and `TV Shows` pointing at
+    `/opt/stremio-plex-bridge/media`, so the automation made a second pair: Plex shows
+    duplicates and it is easy to click the wrong one and play unrelated media. `PUT
+    /library/sections/<id>` now joins the existing section, sending existing paths *plus* the
+    new one because PUT replaces the whole list. `--separate-libraries` restores the old
+    behaviour.
+28. **Test fixtures that share a scratch directory must not clean each other's.** Two
     regression scripts both used `/tmp/fc`; the second deleted it on entry, so the first
     "failed" when run afterwards. Ordering artefacts look exactly like regressions — run each
     suite in isolation before believing a failure.

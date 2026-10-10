@@ -173,7 +173,7 @@ def api(path: str, token: str = "", method: str = "GET", timeout: int = 20,
         q["X-Plex-Token"] = token
     url = BASE + path
     if q:
-        url += ("&" if "?" in url else "?") + urllib.parse.urlencode(q)
+        url += ("&" if "?" in url else "?") + urllib.parse.urlencode(q, doseq=True)
     req = urllib.request.Request(url, method=method)
     req.add_header("Accept", "application/json")
     req.add_header("X-Plex-Product", "Mwatcher")
@@ -245,6 +245,14 @@ def wait_for_signin(timeout: int = SIGNIN_TIMEOUT, quiet: bool = False) -> str:
 
 def claim(claim_token: str) -> bool:
     """POST /myplex/claim -- the server exchanges the token itself and stores the result."""
+    if is_claimed():
+        # Plex answers a claim token with 401 once it already belongs to an account. That is
+        # not a failure -- it is the outcome the caller wanted -- so report it as such rather
+        # than making the whole run exit non-zero and alarming whoever is watching.
+        acct = read_pref("PlexOnlineUsername") or read_pref("PlexOnlineMail") or "your account"
+        ok(f"already signed in as {acct}, so the claim token was not needed")
+        info("Plex refuses a new token while it is signed in; that 401 is expected here")
+        return True
     if not claim_token.startswith("claim-"):
         warn("that does not look like a claim token (it should start with 'claim-')")
     if not server_up():
@@ -261,8 +269,15 @@ def claim(claim_token: str) -> bool:
                 return True
         warn("the server took the token but is not reporting signed-in yet; re-run --verify")
         return is_claimed()
+    if st == 401 and is_claimed():
+        ok("this server is already signed in, so the token was refused and not needed")
+        return True
     bad(f"Plex refused the claim token (HTTP {st}) {err_text(body)}".rstrip())
-    info("claim tokens expire after about 5 minutes — get a fresh one from https://plex.tv/claim")
+    if st == 401:
+        info("401 here usually means the server already belongs to an account, or the token")
+        info("expired (they last about 5 minutes). Check with:  plex_setup.py --verify")
+    else:
+        info("claim tokens expire after about 5 minutes — get a fresh one from https://plex.tv/claim")
     return False
 
 
@@ -387,6 +402,28 @@ def create_section(token: str, name: str, libtype: str, location: str,
     return False, f"HTTP {st} {err_text(body)}".strip()
 
 
+def add_location(token: str, sec: dict, path: str) -> tuple[bool, str]:
+    """Add a folder to an EXISTING section instead of creating a rival library of the same
+    name. Two libraries both called "Movies" is worse than one library with two folders: Plex
+    shows duplicate entries and it is easy to click the wrong one and play unrelated media.
+
+    PUT replaces the whole location list, so the existing paths have to be sent back too.
+    """
+    sid = sec.get("key") or sec.get("id")
+    locs = [(l or {}).get("path") for l in (sec.get("Location") or [])]
+    locs = [l for l in locs if l]
+    if path in locs:
+        return True, "already listed"
+    locs.append(path)
+    params = {"id": sid, "type": sec.get("type", ""), "title": sec.get("title", ""),
+              "agent": sec.get("agent", ""), "scanner": sec.get("scanner", ""),
+              "language": sec.get("language", "en-US"), "location": locs}
+    st, body = api(f"/library/sections/{sid}", token, method="PUT", timeout=30, params=params)
+    if st in (200, 201, 202):
+        return True, f"{len(locs)} folder(s) now in this library"
+    return False, f"HTTP {st} {err_text(body)}".strip()
+
+
 def refresh_section(token: str, sec_id) -> bool:
     st, _ = api(f"/library/sections/{sec_id}/refresh", token, timeout=20)
     return st in (200, 201, 202)
@@ -401,7 +438,7 @@ def set_server_prefs(token: str) -> list[str]:
     return applied
 
 
-def do_libraries(token: str, language: str = "en-US") -> int:
+def do_libraries(token: str, language: str = "en-US", separate: bool = False) -> int:
     hdr("Plex libraries")
     if not token:
         bad("no Plex token — sign in first (see above)")
@@ -421,6 +458,24 @@ def do_libraries(token: str, language: str = "en-US") -> int:
         if hit:
             ok(f"'{hit.get('title', name)}' already covers {path} — left alone")
             continue
+
+        # A library of the same name and type already exists, but points somewhere else --
+        # typically a previous attempt at this same idea. Join it rather than duplicate it.
+        twin = next((s for s in existing
+                     if str(s.get("type", "")) == libtype
+                     and str(s.get("title", "")).strip().lower() == name.strip().lower()), None)
+        if twin and not separate:
+            others = ", ".join((l or {}).get("path", "?") for l in (twin.get("Location") or []))
+            good, detail = add_location(token, twin, path)
+            if good:
+                ok(f"added {path} to your existing '{name}' library ({detail})")
+                warn(f"that library also still contains: {others}")
+                info("one library with two folders beats two libraries called 'Movies' — Plex")
+                info("would otherwise show duplicates, and it is easy to play the wrong one.")
+                info(f"to drop the old folder: Plex → {name} → Manage → Edit → uncheck it")
+                continue
+            warn(f"could not join the existing '{name}' library ({detail}) — creating a separate one")
+
         good, detail = create_section(token, name, libtype, path, language)
         if good:
             ok(f"created library '{name}' → {path}")
@@ -498,6 +553,8 @@ def main() -> int:
                     help="create the Movies and TV Shows libraries, then scan them")
     ap.add_argument("--verify", action="store_true", help="report Plex's actual state")
     ap.add_argument("--language", default=os.environ.get("PLEX_LANG", "en-US"))
+    ap.add_argument("--separate-libraries", action="store_true",
+                    help="create new sections even when one of the same name already exists")
     ap.add_argument("--timeout", type=int, default=SIGNIN_TIMEOUT)
     ap.add_argument("--base-url", default=None)
     ap.add_argument("--media-dir", default=None)
@@ -528,7 +585,7 @@ def main() -> int:
             ok("already signed in to Plex")
 
     if a.libraries:
-        rc += do_libraries(token, a.language)
+        rc += do_libraries(token, a.language, separate=a.separate_libraries)
     if a.verify:
         rc += do_verify(token)
 
