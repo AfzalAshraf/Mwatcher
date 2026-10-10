@@ -197,6 +197,25 @@ bridge_lan_bound() {
 
 lan_ip() { ip route get 1.1.1.1 2>/dev/null | grep -o 'src [0-9.]*' | awk '{print $2}' | head -1 || true; }
 
+# What the RUNNING process is bound to, as opposed to what the config file says. These
+# disagree whenever bridge.env was edited without a restart, and the config-reading check
+# alone then reports a healthy setup that no client can reach.
+bridge_bind_reality() {
+  local port="${1:-$BRIDGE_PORT}" addrs=""
+  if have ss; then
+    addrs="$(ss -ltnH 2>/dev/null | awk -v p=":$port" '$4 ~ p"$" {print $4}')"
+  elif have netstat; then
+    addrs="$(netstat -ltn 2>/dev/null | awk -v p=":$port" '$4 ~ p"$" {print $4}')"
+  fi
+  [ -n "$addrs" ] || return 1
+  # Report EVERY listener on that port, not the first one. A port can have several lines,
+  # and `exit` on the first match is how a loopback-only bridge gets declared reachable.
+  printf '%s' "$addrs" | tr '\n' ',' | sed 's/,$//'
+  # Reachable from the LAN iff at least one listener is a wildcard or a non-loopback address.
+  printf '%s\n' "$addrs" | grep -qvE '^(127\.|\[::1\]:)' && return 0
+  return 1
+}
+
 # Set VAR in bridge.env -- replace the line (even a commented one) or append it.
 bridge_env_set() {
   local v="$1" val="$2" f="$CONFIG_DIR/bridge.env"
@@ -485,8 +504,24 @@ do_doctor() {
   if pt_enabled; then
     local pt_pub
     pt_pub="$(fc_var_from "$CONFIG_DIR/bridge.env" TELESTREAM_PUBLIC_BASE_URL 2>/dev/null || true)"
-    if bridge_lan_bound; then
-      ok "play-through: the bridge listens beyond loopback, so clients can stream through it"
+    local real=""
+    real="$(bridge_bind_reality "$BRIDGE_PORT" 2>/dev/null || true)"
+    if [ -n "$real" ] && ! bridge_bind_reality "$BRIDGE_PORT" >/dev/null 2>&1 \
+       && bridge_lan_bound; then
+      # The config and the live socket disagree -- bridge.env was edited but the service was
+      # never restarted. Reporting the config alone says "healthy" while every client fails.
+      bad "play-through: bridge.env says BRIDGE_HOST beyond loopback, but the RUNNING bridge
+       is bound to ${real}. Clients cannot reach it, so every .strm title gives s1001 and
+       Plex's log says 'video has neither a video stream nor an audio stream'.
+       Fix:  sudo systemctl restart mwatcher-bridge"
+      problems=$((problems+1))
+    elif bridge_lan_bound; then
+      if [ -n "$real" ]; then
+        ok "play-through: the RUNNING bridge is bound to ${real}, so clients can reach it"
+      else
+        ok "play-through: the bridge is configured to listen beyond loopback"
+        info "could not read the live socket (no ss/netstat), so that is the config, not proof"
+      fi
     else
       bad "play-through is enabled but the bridge only listens on 127.0.0.1: every .strm plays
        on THIS box and fails with s1001 on every other client.
@@ -1064,7 +1099,16 @@ EOF
   done
   systemctl daemon-reload
   # shellcheck disable=SC2086
-  systemctl enable --now $units >/dev/null 2>&1 || true
+  systemctl enable $units >/dev/null 2>&1 || true
+  # `enable --now` is a NO-OP for a unit that is already running, so the BRIDGE_HOST=0.0.0.0
+  # that §5b just wrote into bridge.env would not take effect until someone restarted by
+  # hand. The bridge stayed bound to loopback while its config said otherwise: doctor
+  # reported "listens beyond loopback" from the file, every client got s1001, and Plex's log
+  # said "video has neither a video stream nor an audio stream" because the fetch was
+  # refused. Restart unconditionally. $units excludes fastcombo whenever it was adopted.
+  for s in $units; do
+    systemctl restart "$s" >/dev/null 2>&1 || true
+  done
   sleep 2
   for s in $units; do
     svc_active "$s" && ok "$s running" || bad "$s failed to start → sudo journalctl -u $s -n 30 --no-pager"

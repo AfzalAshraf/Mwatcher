@@ -115,6 +115,10 @@ which *is* error s1001. Read the first `CHUNK`, run `sniff_html()` plus a
 | Plex surgery | `--sections` lists ids and flags duplicate names; `--drop-location` reports without `--yes` and removes with it; dropping the last folder refuses and points at `--delete-section`; `--delete-section` refuses without `--yes` |
 | Plex unreachable | `--sections` says "not answering" instead of "no libraries" when the server is down |
 | CLI action default | `TELESTREAM_ACTION=strm` now makes the one-shot CLI write a pointer; it used to download a full file |
+| **§6 never restarted the bridge** | `enable --now` is a no-op for a running unit, so `BRIDGE_HOST=0.0.0.0` written by §5b never took effect. Confirmed on the real box: doctor §1 read the config and said "listens beyond loopback" while §3 proved the address unreachable and Plex logged `MDE: video has neither a video stream nor an audio stream` |
+| `bridge_bind_reality` | decides correctly on all 5 synthetic listener shapes (loopback, wildcard, explicit LAN IP, both, IPv6 loopback); reports every listener, not the first |
+| `do_HEAD` | 200 on `/healthz`, 404 on an unknown play key — was `501 Unsupported method` |
+| sudo and `MEDIA_DIR` | `SUDO_USER=afine` → `/home/afine/media`; unknown user → `/home/<u>/media`; explicit `MEDIA_DIR` wins; `/root/media` is refused outright |
 
 ### Adopting an existing Fast Combo (layout C — all on the VPS)
 
@@ -314,7 +318,20 @@ bogus `/play/deadbeef00.mkv` → 404 · `status`/`doctor`/`--help` exit 0.
 31. **"No libraries" and "Plex is unreachable" must not print the same thing.** Both surface
     as an empty list, and telling someone their libraries are gone when the server is merely
     down invites them to go and re-create things.
-32. **Test fixtures that share a scratch directory must not clean each other's.** Two
+32. **`systemctl enable --now` does not restart a unit that is already running.** The single
+    most damaging bug in this project: §5b wrote `BRIDGE_HOST=0.0.0.0` into bridge.env and
+    §6 then "started" a service that was already up, so the running process kept its old
+    loopback bind. Config said LAN, socket said loopback, every client got s1001 — and the
+    doctor's own play-through check read the *config* and reported it healthy. Restart
+    explicitly after any config write, and verify the live socket, not the file.
+33. **Under sudo, `~` is `/root`.** `sudo plex_setup.py --libraries` created two libraries at
+    `/root/media` — a directory that does not exist — adding to the duplicates already there.
+    Resolve `SUDO_USER` through `pwd`, and refuse to create libraries under `/root` at all.
+34. **Not implementing `do_HEAD` answers 501, not 405.** A diagnostic `curl -I` then looks
+    like the stream is broken rather than the verb being unhandled.
+35. **`awk '...{print; exit}'` on `ss` output picks one listener at random.** A port can have
+    several; decide from all of them.
+36. **Test fixtures that share a scratch directory must not clean each other's.** Two
     regression scripts both used `/tmp/fc`; the second deleted it on entry, so the first
     "failed" when run afterwards. Ordering artefacts look exactly like regressions — run each
     suite in isolation before believing a failure.

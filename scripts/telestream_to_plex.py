@@ -1775,6 +1775,34 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:              # headers may already be gone; nothing to do
                 pass
 
+    def do_HEAD(self) -> None:  # noqa: N802
+        """Answer HEAD. `curl -I` and some clients probe with it; without this the bridge
+        replies 501 Unsupported method, which reads like a broken stream rather than an
+        unhandled verb."""
+        path = urllib.parse.urlparse(self.path).path
+        if path.startswith("/play/"):
+            key = re.sub(r"\.(mkv|mp4|webm|avi)$", "", os.path.basename(path))
+            try:
+                play_entry(key)
+            except KeyError:
+                self.send_response(404)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            final = cache_path(key, True)
+            size = os.path.getsize(final) if os.path.exists(final) else 0
+            self.send_response(200)
+            self.send_header("Content-Type", "video/x-matroska")
+            self.send_header("Accept-Ranges", "bytes")
+            if size:
+                self.send_header("Content-Length", str(size))
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def do_GET(self) -> None:  # noqa: N802
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path

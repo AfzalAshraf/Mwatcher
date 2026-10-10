@@ -42,7 +42,27 @@ import urllib.request
 
 PLEX_PORT = int(os.environ.get("PLEX_PORT", "32400"))
 BASE = os.environ.get("PLEX_BASE_URL", f"http://127.0.0.1:{PLEX_PORT}").rstrip("/")
-MEDIA_DIR = os.environ.get("MEDIA_DIR", os.path.expanduser("~/media"))
+def _default_media_dir() -> str:
+    """Under sudo, ~ is /root -- which quietly creates libraries at /root/media.
+
+    This happened for real: `sudo plex_setup.py --libraries` made two brand-new libraries
+    pointing at a directory that does not exist, on top of the duplicates already there.
+    Resolve the invoking user's home instead.
+    """
+    env = os.environ.get("MEDIA_DIR")
+    if env:
+        return env
+    su = os.environ.get("SUDO_USER") or ""
+    if su and su != "root":
+        try:
+            import pwd
+            return os.path.join(pwd.getpwnam(su).pw_dir, "media")
+        except Exception:
+            return f"/home/{su}/media"
+    return os.path.expanduser("~/media")
+
+
+MEDIA_DIR = _default_media_dir()
 SIGNIN_TIMEOUT = int(os.environ.get("PLEX_SIGNIN_TIMEOUT", "600"))
 
 # Preferred agent/scanner per library type, newest first. Used only as a hint: whatever the
@@ -445,6 +465,12 @@ def do_libraries(token: str, language: str = "en-US", separate: bool = False) ->
         return 1
     if not os.path.isdir(MEDIA_DIR):
         warn(f"{MEDIA_DIR} does not exist yet")
+
+    if MEDIA_DIR.startswith("/root"):
+        bad(f"refusing to create libraries under {MEDIA_DIR} — that is root's home, which")
+        bad("means this ran under sudo without MEDIA_DIR. Your media is not there.")
+        info("re-run with the real path, e.g.  --media-dir /home/<you>/media")
+        return 1
 
     wanted = [("Movies", "movie", os.path.join(MEDIA_DIR, "Movies")),
               ("TV Shows", "show", os.path.join(MEDIA_DIR, "TV Shows"))]
