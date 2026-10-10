@@ -40,9 +40,20 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field, asdict
+
+# Pick up ~/.config/mwatcher/bridge.env when run straight from a shell. systemd does this
+# for the service via EnvironmentFile=; a shell does not, and --key then looks mandatory
+# even though the installer already wrote the key to disk. Real env vars still win.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    import envfile
+    envfile.load()
+except ImportError:  # pragma: no cover - usable without it, just needs --key
+    pass
 
 DEFAULT_CINEMETA = "https://v3-cinemeta.strem.io"
 DEFAULT_TIMEOUT = float(os.environ.get("FASTCOMBO_TIMEOUT", "45"))
@@ -300,7 +311,11 @@ def fetch_streams(base: str, access_key: str, stype: str, sid: str, token: str =
     if not base:
         raise RuntimeError("FASTCOMBO_BASE_URL is not set")
     if not access_key:
-        raise RuntimeError("FASTCOMBO_ACCESS_KEY is not set (it is the secret part of your addon link)")
+        raise RuntimeError(
+            "FASTCOMBO_ACCESS_KEY is not set (it is the secret part of your addon link). "
+            "It normally lives in ~/.config/mwatcher/bridge.env, which systemd loads for the "
+            "service but a shell does not -- pass --key, or export FASTCOMBO_ACCESS_KEY."
+        )
     if stype not in ("movie", "series", "tv", "channel", "anime"):
         raise RuntimeError(f"unsupported type {stype!r} (use movie or series)")
 
@@ -410,7 +425,13 @@ if __name__ == "__main__":
         print(json.dumps(title_info(a.query), indent=2))
     else:
         sid = episode_id(a.query, a.season, a.episode) if a.type == "series" else a.query
-        cands = fetch_streams(a.base, a.key, a.type, sid, a.token)
+        try:
+            cands = fetch_streams(a.base, a.key, a.type, sid, a.token)
+        except RuntimeError as exc:
+            # A missing key or base URL is a configuration problem, not a crash. A traceback
+            # hides the one sentence that actually tells you what to do.
+            print(f"error: {exc}", file=sys.stderr)
+            sys.exit(2)
         best, fallbacks = pick(cands, a.prefer)
         print(f"{len(cands)} streams from Fast Combo; {len(fallbacks)} downloadable\n")
         for c in rank(cands, a.prefer)[:15]:

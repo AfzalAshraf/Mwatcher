@@ -27,6 +27,7 @@ your Stremio addons ──▶ Fast Combo ──▶ Mwatcher bridge ──▶ sta
 | `scripts/telestream_to_plex.py` | The bridge: dashboard + HTTP API + CLI. Resolve → download **or** stream through a cache → name → library |
 | `scripts/stremio_source.py` | Fast Combo / Cinemeta client: parses and ranks addon streams, picks the best |
 | `scripts/seerr_source.py` | Seerr client: search → TMDB id → create a request, plus `--doctor` for the request path |
+| `scripts/envfile.py` | Loads `~/.config/mwatcher/bridge.env` so the CLI works from a plain shell, not just under systemd |
 | `scripts/plex_setup.py` | Plex automation: waits for your Google sign-in, creates both libraries via the API, enables auto-scan, verifies |
 | `demo/fake_plex.py` | A pretend Plex Media Server, strict about the things real Plex is strict about, so the above is testable with no Plex install |
 | `services/seerr-stack/docker-compose.yml` | Seerr + Radarr + Sonarr + Prowlarr + qBittorrent, all sharing one media path |

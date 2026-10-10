@@ -51,6 +51,15 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+# Same reasoning as stremio_source: a shell does not get EnvironmentFile=, so SEERR_URL and
+# SEERR_API_KEY look unset even when the installer wrote them. Real env vars still win.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    import envfile
+    envfile.load()
+except ImportError:  # pragma: no cover - usable without it
+    pass
+
 SEERR_URL = os.environ.get("SEERR_URL", "http://127.0.0.1:5055").rstrip("/")
 SEERR_API_KEY = os.environ.get("SEERR_API_KEY", "")
 SEERR_TIMEOUT = float(os.environ.get("SEERR_TIMEOUT", "20"))

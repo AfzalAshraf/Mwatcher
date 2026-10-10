@@ -363,7 +363,9 @@ do_status() {
     info "control panel:  $fcbase/$key/configure"
     info "dashboard:      http://127.0.0.1:$BRIDGE_PORT/"
     local n
-    n="$(curl -s -m 10 "$fcbase/$key/manifest.json" 2>/dev/null | grep -o '"Addon [0-9]*"' | wc -l || echo 0)"
+    # `grep | wc -l || echo 0` prints TWO zeros when grep matches nothing: wc emits its own
+    # 0, then pipefail makes the pipeline fail and the `|| echo 0` adds a second line.
+    n="$(curl -s -m 10 "$fcbase/$key/manifest.json" 2>/dev/null | { grep -o '"Addon [0-9]*"' || true; } | wc -l)"
     if curl -s -m 10 "$fcbase/$key/manifest.json" 2>/dev/null | grep -q '"id"'; then
       ok "Fast Combo answers with that key"
       info "addons merged into the manifest description: ${n:-0}"

@@ -104,6 +104,8 @@ which *is* error s1001. Read the first `CHUNK`, run `sniff_html()` plus a
 | play-through reachability | 12 helper checks + 4 end-to-end: bind widened, LAN IP derived, idempotent, untouched when off |
 | `plex_setup.py` vs `demo/fake_plex.py` | claim → libraries → scan → verify, all green; idempotent re-run; not-signed-in fails cleanly; agent-worded 400 surfaces Plex's real sentence *and* the restart hint; language-worded 400 surfaces the sentence and suppresses the hint |
 | `install.sh auto` | end-to-end against the fake Plex, exit 0; unknown args warned and ignored; `AUTO_MODE` suppresses the manual Next-steps block |
+| `envfile` + the CLI | the user's exact failing command now resolves and downloads with the key present **only** in `bridge.env`; an explicit env var still overrides it; spaces in `TELESTREAM_TV_DIR` preserved; matched quotes stripped from `TELESTREAM_DOWNLOAD_CMD` with its inner quoting intact; comments, `export `, and empty values handled |
+| `status` addon count | old expression yielded `0\|0\|` (two lines) under `pipefail`, new yields `0\|` |
 
 ### Adopting an existing Fast Combo (layout C — all on the VPS)
 
@@ -250,7 +252,19 @@ bogus `/play/deadbeef00.mkv` → 404 · `status`/`doctor`/`--help` exit 0.
 21. **`and` binds tighter than `or`.** `if problems and "agent" in e or "scanner" in e:` parsed
     as `(problems and "agent" in e) or ("scanner" in e)`, so the restart hint would have fired
     on any error mentioning a scanner even with zero problems. Parenthesise.
-22. **Test fixtures that share a scratch directory must not clean each other's.** Two
+22. **systemd's `EnvironmentFile=` does not exist for a shell.** The bridge worked perfectly
+    as a service while the identical CLI call failed with "FASTCOMBO_ACCESS_KEY is not set" —
+    and `install.sh status` said the key was set and Fast Combo answered with it, so the two
+    outputs flatly contradicted each other. The installer's own Next-steps block printed that
+    broken command. `scripts/envfile.py` now loads `bridge.env` at import for every CLI entry
+    point, with real environment variables still winning. **Verified against the user's real
+    box:** their Fast Combo turned out to live in `/opt/fastcombo`, not `~/stremio-addons` —
+    adoption via `systemctl show -p WorkingDirectory` found it where path-guessing could not.
+23. **`grep | wc -l || echo 0` prints two zeros under `pipefail`** when grep matches nothing:
+    `wc` emits its own `0`, then pipefail fails the pipeline and `|| echo 0` adds a second
+    line, so `${n:-0}` rendered a bare `0` on its own line in `status`. Wrap the grep in
+    `{ grep … || true; }` instead of rescuing the pipeline.
+24. **Test fixtures that share a scratch directory must not clean each other's.** Two
     regression scripts both used `/tmp/fc`; the second deleted it on entry, so the first
     "failed" when run afterwards. Ordering artefacts look exactly like regressions — run each
     suite in isolation before believing a failure.

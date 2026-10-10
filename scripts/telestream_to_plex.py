@@ -136,6 +136,16 @@ try:
 except ImportError:  # pragma: no cover - Seerr support is optional
     seerr_source = None
 
+# The service gets its config from EnvironmentFile= in mwatcher-bridge.service. A shell does
+# not, so without this the CLI reports "FASTCOMBO_ACCESS_KEY is not set" while the key sits
+# in a file the installer wrote -- and `install.sh status` says everything is fine. Values
+# already in the environment win, so an explicit override still works.
+try:
+    import envfile
+    ENV_FILE = envfile.load()
+except ImportError:  # pragma: no cover - still runs, just without the env file
+    ENV_FILE = None
+
 # --------------------------------------------------------------------------- config
 
 HOME = os.path.expanduser("~")
@@ -727,7 +737,12 @@ def fastcombo_plan(payload: dict) -> dict:
     if stremio_source is None:
         raise RuntimeError("stremio_source.py is missing next to this script")
     if not FASTCOMBO_ACCESS_KEY:
-        raise RuntimeError("FASTCOMBO_ACCESS_KEY is not set (the secret part of your Fast Combo link)")
+        raise RuntimeError(
+            "FASTCOMBO_ACCESS_KEY is not set (the secret part of your Fast Combo link). "
+            f"Looked in the environment{f' and {ENV_FILE}' if ENV_FILE else ''}; the file is "
+            "normally ~/.config/mwatcher/bridge.env. Repair it with "
+            "`sudo bash install.sh`, or set FASTCOMBO_ACCESS_KEY=... for this one run."
+        )
 
     imdb = str(payload.get("imdb") or "").strip()
     title = str(payload.get("title") or "").strip()
