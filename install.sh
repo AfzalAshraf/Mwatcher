@@ -633,17 +633,29 @@ do_doctor() {
               ;;
             *)
               ok "  play-through pointer — no downloaded file, that is intentional"
-              local tpath; tpath="$(printf '%s' "$target" | sed -E 's#^[a-zA-Z]+://[^/]+##')"
-              if curl -s -m 8 -r 0-1 -o /dev/null "$target" 2>/dev/null; then
-                ok "  the bridge answers that URL, so clients can stream through it"
-              elif curl -s -m 8 -r 0-1 -o /dev/null "http://127.0.0.1:$BRIDGE_PORT$tpath" 2>/dev/null; then
-                warn "  the bridge answers locally but NOT at that address — clients on other
-  machines will get s1001. Check the firewall, the IP, and any tunnel:
+              local tpath code code2
+              tpath="$(printf '%s' "$target" | sed -E 's#^[a-zA-Z]+://[^/]+##')"
+              # Test REACHABILITY, not transfer completeness. curl's exit status lies here:
+              # the bridge answers a 2-byte range with 206 and then closes, which curl can
+              # report as a failed transfer (18) even though the server answered perfectly.
+              # That is how this printed "answers locally but NOT at that address" while the
+              # bridge's own log showed a 206 from that very address. Any HTTP status means
+              # it is reachable; only 000 means the connection never happened.
+              code="$(curl -s -m 8 -o /dev/null -w '%{http_code}' -r 0-1 "$target" 2>/dev/null || true)"
+              code2="$(curl -s -m 8 -o /dev/null -w '%{http_code}' -r 0-1 "http://127.0.0.1:$BRIDGE_PORT$tpath" 2>/dev/null || true)"
+              [ -n "$code" ] || code="000"
+              [ -n "$code2" ] || code2="000"
+              if [ "$code" != "000" ]; then
+                ok "  the bridge answers that URL (HTTP $code), so clients can stream through it"
+              elif [ "$code2" != "000" ]; then
+                warn "  the bridge answers locally (HTTP $code2) but NOT at that address (got
+  $code) — clients on other machines will get s1001. Check the firewall, the IP, and any
+  tunnel:
        sudo ufw allow from 192.168.0.0/16 to any port $BRIDGE_PORT"
                 problems=$((problems+1))
               else
-                bad "  the bridge does not answer that URL at all → s1001.
-  Fix: sudo systemctl restart mwatcher-bridge, then re-test playback"
+                bad "  the bridge does not answer that URL at all (neither address answered) —
+  s1001. Fix: sudo systemctl restart mwatcher-bridge, then re-test playback"
                 problems=$((problems+1))
               fi
               case "$target" in
@@ -1235,6 +1247,63 @@ lan_ip_cli() {
   ip route get 1.1.1.1 2>/dev/null | grep -o 'src [0-9.]*' | awk '{print $2}' | head -1 || true
 }
 
+# =============================================================================
+#  update -- pull the latest code and apply it, in one command.
+#
+#  A private box behind NAT with no port forwarding cannot be pushed to: nothing
+#  outside can reach it. So updates have to be PULLED from the box itself. This
+#  does the whole sequence that otherwise takes six commands and is easy to get
+#  half-right -- pull, reload systemd, restart the bridge (which is what makes a
+#  changed bridge.env take effect), repair any orphaned pointers, then reconcile
+#  the Plex libraries.
+# =============================================================================
+do_update() {
+  need_root update
+  hdr "Update Mwatcher"
+  cd "$REPO_DIR" || die "cannot enter $REPO_DIR"
+  if [ -d .git ] && have git; then
+    local before after
+    before="$(git rev-parse --short HEAD 2>/dev/null || echo '?')"
+    if git pull --ff-only 2>&1 | sed 's/^/  /'; then :; else
+      warn "git pull did not complete cleanly; continuing with what is on disk"
+    fi
+    after="$(git rev-parse --short HEAD 2>/dev/null || echo '?')"
+    if [ "$before" = "$after" ]; then
+      ok "already up to date ($after)"
+    else
+      ok "updated $before → $after"
+    fi
+  else
+    warn "$REPO_DIR is not a git checkout — nothing to pull"
+  fi
+
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  # A restart is not optional: enable --now does nothing to a running unit, so a
+  # bridge.env change silently never takes effect. See docs/WORKLOG.md trap 32.
+  if systemctl restart mwatcher-bridge >/dev/null 2>&1; then
+    ok "restarted mwatcher-bridge"
+    local real=""
+    real="$(bridge_bind_reality "$BRIDGE_PORT" 2>/dev/null || true)"
+    if [ -n "$real" ]; then
+      if bridge_bind_reality "$BRIDGE_PORT" >/dev/null 2>&1; then
+        ok "the running bridge is bound to ${real} — reachable from your LAN"
+      else
+        bad "the running bridge is bound to ${real} — play-through will fail on other devices"
+      fi
+    fi
+  else
+    bad "mwatcher-bridge did not restart → sudo journalctl -u mwatcher-bridge -n 30 --no-pager"
+  fi
+
+  hdr "Repairing play-through pointers"
+  if as_user python3 "$REPO_DIR/scripts/telestream_to_plex.py" --repoint 2>&1 \
+       | grep -E '"orphaned"|"recreated"|"failed"|^\[' | tail -12 | sed 's/^/  /'; then :; fi
+
+  hdr "Plex libraries"
+  python3 "$REPO_DIR/scripts/plex_setup.py" \
+    --media-dir "$MEDIA_DIR" --libraries --verify || true
+}
+
 do_uninstall() {
   need_root uninstall
   hdr "Removing Mwatcher services (your media and Plex libraries are kept)"
@@ -1421,6 +1490,8 @@ Mwatcher installer
                                           the same, for a box with no browser: get the token
                                           from https://plex.tv/claim (valid ~5 minutes)
   sudo bash install.sh                    install / repair, then show status
+  sudo bash install.sh update             git pull + restart the bridge + repair pointers
+                                          + reconcile the Plex libraries, in one command
   sudo bash install.sh status             report only, change nothing
   sudo bash install.sh doctor [title]     diagnose playback problems (s1001 etc.)
   sudo bash install.sh seerr              Seerr + Radarr/Sonarr + Prowlarr + qBittorrent
@@ -1443,6 +1514,7 @@ EOF
 case "${1:-install}" in
   install|"")  do_install ;;
   auto)        shift; do_auto "$@"; exit "$AUTO_RC" ;;
+  update|upgrade) do_update ;;
   status)      do_status ;;
   doctor)      shift; do_doctor "${1:-}" ;;
   seerr)       do_seerr ;;

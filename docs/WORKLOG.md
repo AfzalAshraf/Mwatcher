@@ -118,6 +118,8 @@ which *is* error s1001. Read the first `CHUNK`, run `sniff_html()` plus a
 | **§6 never restarted the bridge** | `enable --now` is a no-op for a running unit, so `BRIDGE_HOST=0.0.0.0` written by §5b never took effect. Confirmed on the real box: doctor §1 read the config and said "listens beyond loopback" while §3 proved the address unreachable and Plex logged `MDE: video has neither a video stream nor an audio stream` |
 | `bridge_bind_reality` | decides correctly on all 5 synthetic listener shapes (loopback, wildcard, explicit LAN IP, both, IPv6 loopback); reports every listener, not the first |
 | `do_HEAD` | 200 on `/healthz`, 404 on an unknown play key — was `501 Unsupported method` |
+| `install.sh update` | pull → daemon-reload → restart → repoint → libraries → verify, exit 0; a private box behind NAT cannot be pushed to, so updates are pulled |
+| doctor §3 reachability | now decides on the HTTP status, not curl's exit code: `/healthz` reachable, dead port still `UNREACHABLE`, `HEAD` 200 (was 501) |
 | sudo and `MEDIA_DIR` | `SUDO_USER=afine` → `/home/afine/media`; unknown user → `/home/<u>/media`; explicit `MEDIA_DIR` wins; `/root/media` is refused outright |
 
 ### Adopting an existing Fast Combo (layout C — all on the VPS)
@@ -331,7 +333,17 @@ bogus `/play/deadbeef00.mkv` → 404 · `status`/`doctor`/`--help` exit 0.
     like the stream is broken rather than the verb being unhandled.
 35. **`awk '...{print; exit}'` on `ss` output picks one listener at random.** A port can have
     several; decide from all of them.
-36. **Test fixtures that share a scratch directory must not clean each other's.** Two
+36. **`curl -s -o /dev/null URL` exit status is not a reachability test.** The bridge answers
+    a 2-byte range with 206 and closes, which curl can report as a failed transfer, so doctor
+    printed "answers locally but NOT at that address" while the bridge's own access log showed
+    a 206 from that very address. Ask for `%{http_code}` and treat anything but `000` as
+    reachable; `000` is the only value that means the connection never happened.
+37. **A private box behind NAT cannot be pushed to.** GitHub Actions runners are out on the
+    internet and have no inbound path to 192.168.x.x with no port forwarding, so an
+    SSH-deploy workflow is not available here — and opening a hole to enable it would be the
+    wrong trade for a box whose `/play/<key>` has no authentication. Updates are pulled from
+    the box: `install.sh update`. Never accept a user's SSH private key to work around this.
+38. **Test fixtures that share a scratch directory must not clean each other's.** Two
     regression scripts both used `/tmp/fc`; the second deleted it on entry, so the first
     "failed" when run afterwards. Ordering artefacts look exactly like regressions — run each
     suite in isolation before believing a failure.
